@@ -215,6 +215,15 @@ resource "aws_lambda_event_source_mapping" "jobs" {
   function_name    = aws_lambda_function.dispatcher.arn
   batch_size       = 1 # one job per invocation: a failure retries exactly that job
 
+  # NOTE(webhook-cutover): once webhook ingress is fully on this SQS path, add
+  #   scaling_config { maximum_concurrency = <small N> }
+  # here — that is the STRUCTURAL fix for dispatch stampedes. A webhook burst
+  # otherwise fans out into N parallel dispatcher invokes whose ListMicrovms
+  # calls throttle the low-TPS microvm control plane (observed live:
+  # simultaneous queued jobs -> ThrottlingException -> jobs orphaned onto the
+  # 5-minute sweep). The dispatcher's bounded jittered throttle retry is the
+  # tactical guard; capping ESM concurrency removes the stampede at the source.
+
   # Partial batch responses: the dispatcher returns batchItemFailures so only
   # the failed/malformed record retries (and dead-letters alone) — an
   # already-dispatched batch sibling is never re-driven into a duplicate VM.

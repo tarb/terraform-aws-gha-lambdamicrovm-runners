@@ -1,10 +1,11 @@
 //! GitHub Actions runner autoscaler — webhook dispatcher.
 //!
-//! One Lambda, four intake shapes (SQS-delivered EventBridge envelopes,
-//! direct EventBridge, the scheduled sweep marker, the legacy Function-URL
-//! webhook), routed by [`intake::Intake`] into the domain services in
-//! [`services::Services`]. The invariant everything here serves: every
-//! failure degrades to a cold launch or a terminate — never a stuck job.
+//! One Lambda, five intake shapes (SQS-delivered EventBridge envelopes,
+//! direct EventBridge, the scheduled sweep marker, a VM's direct-invoke idle
+//! report, the legacy Function-URL webhook), routed by [`intake::Intake`]
+//! into the domain services in [`services::Services`]. The invariant
+//! everything here serves: every failure degrades to a cold launch or a
+//! terminate — never a stuck job.
 
 mod aws;
 mod clock;

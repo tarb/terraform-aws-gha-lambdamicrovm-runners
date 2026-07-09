@@ -1,8 +1,9 @@
-//! AWS control-plane seam: terminate-self and the SSM handoff mailbox.
+//! AWS control-plane seam: terminate-self, the dispatcher idle-report
+//! invoke, and the SSM handoff mailbox.
 //!
 //! One trait per external system so the pool/terminate logic is testable
 //! with hand-rolled fakes. Per-call timeouts live at the call sites
-//! (20 s terminate, 15 s SSM).
+//! (20 s terminate, 10 s invoke, 15 s SSM).
 
 use async_trait::async_trait;
 
@@ -13,6 +14,10 @@ pub struct CloudError(pub String);
 #[async_trait]
 pub trait CloudControl: Send + Sync {
     async fn terminate_microvm(&self, id: &str) -> Result<(), CloudError>;
+    /// Synchronous (RequestResponse) Lambda invoke of `function` with the
+    /// given JSON payload. `Ok` only when the invocation ran without a
+    /// function error.
+    async fn invoke_function(&self, function: &str, payload: &str) -> Result<(), CloudError>;
     /// `Ok(None)` means ParameterNotFound — silent in the mailbox polling
     /// path. `Err` is any other failure (logged by the caller).
     async fn get_parameter(&self, name: &str) -> Result<Option<String>, CloudError>;
@@ -21,6 +26,7 @@ pub trait CloudControl: Send + Sync {
 
 struct Clients {
     mv: aws_sdk_lambdamicrovms::Client,
+    lambda: aws_sdk_lambda::Client,
     ssm: aws_sdk_ssm::Client,
 }
 
@@ -48,6 +54,7 @@ impl RealAws {
                     .await;
                 Clients {
                     mv: aws_sdk_lambdamicrovms::Client::new(&conf),
+                    lambda: aws_sdk_lambda::Client::new(&conf),
                     ssm: aws_sdk_ssm::Client::new(&conf),
                 }
             })
@@ -67,6 +74,24 @@ impl CloudControl for RealAws {
             .map_err(|e| {
                 CloudError(aws_sdk_lambdamicrovms::error::DisplayErrorContext(&e).to_string())
             })
+    }
+
+    async fn invoke_function(&self, function: &str, payload: &str) -> Result<(), CloudError> {
+        let c = self.clients().await;
+        let out = c
+            .lambda
+            .invoke()
+            .function_name(function)
+            .invocation_type(aws_sdk_lambda::types::InvocationType::RequestResponse)
+            .payload(aws_sdk_lambda::primitives::Blob::new(payload.as_bytes()))
+            .send()
+            .await
+            .map_err(|e| CloudError(aws_sdk_lambda::error::DisplayErrorContext(&e).to_string()))?;
+        // A handler that raised still answers 200: surface it as a failure.
+        if let Some(kind) = out.function_error() {
+            return Err(CloudError(format!("function error: {kind}")));
+        }
+        Ok(())
     }
 
     async fn get_parameter(&self, name: &str) -> Result<Option<String>, CloudError> {
@@ -119,6 +144,10 @@ pub mod testsupport {
         pub terminated: Mutex<Vec<String>>,
         /// Number of terminate calls that fail before one succeeds.
         pub terminate_failures: Mutex<u32>,
+        /// Recorded successful invokes: (function name, payload).
+        pub invokes: Mutex<Vec<(String, String)>>,
+        /// Number of invoke calls that fail before one succeeds.
+        pub invoke_failures: Mutex<u32>,
     }
 
     #[async_trait]
@@ -130,6 +159,19 @@ pub mod testsupport {
                 return Err(CloudError("throttled".to_string()));
             }
             self.terminated.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+
+        async fn invoke_function(&self, function: &str, payload: &str) -> Result<(), CloudError> {
+            let mut left = self.invoke_failures.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Err(CloudError("throttled".to_string()));
+            }
+            self.invokes
+                .lock()
+                .unwrap()
+                .push((function.to_string(), payload.to_string()));
             Ok(())
         }
 

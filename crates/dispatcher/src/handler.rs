@@ -73,6 +73,11 @@ pub async fn handle(
             let dispatched = svc.sweeper.sweep(&deadline).await?;
             Ok(json!({"ok": "swept", "dispatched": dispatched}))
         }
+        // A VM's direct idle report: never errors (the report is advisory —
+        // the VM has its own terminate fallback).
+        Intake::Idle(report) => Ok(json!({
+            "ok": svc.pool.intake_idle(&report).await.to_string()
+        })),
         Intake::FunctionUrl(req) => on_function_url(svc, req).await,
     }
 }

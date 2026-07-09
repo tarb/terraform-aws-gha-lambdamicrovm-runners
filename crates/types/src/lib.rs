@@ -5,8 +5,10 @@
 
 pub mod fnurl;
 mod id;
+mod idle;
 mod payload;
 pub mod sig;
 
 pub use id::{MicrovmId, OurRunner, RunnerName};
+pub use idle::{IdleEvent, IdleReason, IdleReport};
 pub use payload::RunPayload;

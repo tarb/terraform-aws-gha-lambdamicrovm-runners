@@ -115,6 +115,9 @@ pub struct RunConfig {
     pub handoff_prefix: Option<String>,
     /// Passed through to JIT minting / config.sh; shape intentionally loose.
     pub runner_group: Option<Value>,
+    /// The dispatcher Lambda's function name, for idle reports. Absent when
+    /// an old dispatcher built the payload — reporting is then skipped.
+    pub dispatcher_fn: Option<String>,
 }
 
 impl RunConfig {
@@ -168,6 +171,7 @@ impl RunConfig {
                 .map(|s| s.trim_end_matches('/').to_string())
                 .filter(|s| !s.is_empty()),
             runner_group: map.get("runner_group").cloned(),
+            dispatcher_fn: field_str(&map, "dispatcher_fn"),
         }
     }
 
@@ -310,6 +314,20 @@ mod tests {
     fn legacy_pat_alias_is_accepted_for_the_token() {
         let cfg = RunConfig::from_value(json!({"pat": "legacy"}));
         assert_eq!(cfg.token.unwrap().expose_secret(), "legacy");
+    }
+
+    #[test]
+    fn dispatcher_fn_is_read_and_absent_or_empty_stays_none() {
+        let cfg = RunConfig::from_value(json!({"dispatcher_fn": "gha-microvm-dispatcher"}));
+        assert_eq!(cfg.dispatcher_fn.as_deref(), Some("gha-microvm-dispatcher"));
+        // Old-dispatcher payloads (no field) and blank values mean "cannot
+        // report" — reporting is skipped and behavior matches v0.0.2.
+        assert!(RunConfig::from_value(json!({})).dispatcher_fn.is_none());
+        assert!(
+            RunConfig::from_value(json!({"dispatcher_fn": ""}))
+                .dispatcher_fn
+                .is_none()
+        );
     }
 
     #[test]

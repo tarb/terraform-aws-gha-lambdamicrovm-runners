@@ -57,6 +57,38 @@ impl Deadline {
     }
 }
 
+/// Per-repo job-scan bookkeeping for the all-failed canary.
+#[derive(Default)]
+struct ScanTally {
+    attempted: usize,
+    failed: usize,
+    first_err: Option<String>,
+}
+
+impl ScanTally {
+    fn succeeded(&mut self) {
+        self.attempted += 1;
+    }
+
+    fn failed(&mut self, e: &GithubError) {
+        self.attempted += 1;
+        self.failed += 1;
+        self.first_err.get_or_insert_with(|| e.to_string());
+    }
+
+    /// `Some((repos, first error))` when at least one repo was attempted and
+    /// every attempt failed.
+    fn all_failed(&self) -> Option<(usize, &str)> {
+        (self.attempted > 0 && self.failed == self.attempted)
+            .then(|| (self.attempted, self.first_err.as_deref().unwrap_or("")))
+    }
+}
+
+fn emit_scan_failed_everywhere(repos: usize, err: &str) {
+    oplog::emit(json!({"sweep": "scan-failed-everywhere", "repos": repos,
+                       "err": trunc(err, 200)}));
+}
+
 pub struct Sweeper {
     github: Arc<dyn GithubApi>,
     fleet: Arc<Fleet>,
@@ -90,7 +122,15 @@ impl Sweeper {
 
     /// Returns the number of stale jobs re-dispatched.
     pub async fn sweep(&self, deadline: &Deadline) -> Result<i64, GithubError> {
-        let installations = self.github.installations().await?;
+        let installations = match self.github.installations().await {
+            Ok(installations) => installations,
+            Err(e) => {
+                // Nothing was scanned at all: same loud line as the
+                // every-repo-failed case (the error still propagates).
+                emit_scan_failed_everywhere(0, &e.to_string());
+                return Err(e);
+            }
+        };
         let mut dispatched = 0i64;
         let now = self.clock.now();
         // Registered runner names across every scanned repo, for the zombie
@@ -98,6 +138,11 @@ impl Sweeper {
         // misread a mid-job VM as a zombie.
         let mut registered: HashSet<String> = HashSet::new();
         let mut scan_complete = true;
+        // A single systemic failure (e.g. a missing GitHub App permission
+        // 403ing every job scan) hides behind per-repo "repo-failed" lines
+        // while "done, dispatched: 0" looks healthy — tally the scans and
+        // shout when every attempted one failed.
+        let mut scans = ScanTally::default();
 
         'outer: for inst in installations.iter().take(10) {
             if deadline.low() {
@@ -132,16 +177,23 @@ impl Sweeper {
                         scan_complete = false;
                     }
                 }
-                if let Err(e) = self
+                match self
                     .scan_repo_jobs(&repo.full_name, &token, Some(*inst), now, &mut dispatched)
                     .await
                 {
-                    // One repo must not kill the sweep.
-                    oplog::emit(json!({"sweep": "repo-failed", "repo": repo.full_name,
-                                       "err": trunc(&e.to_string(), 150)}));
-                    continue;
+                    Ok(()) => scans.succeeded(),
+                    Err(e) => {
+                        // One repo must not kill the sweep.
+                        scans.failed(&e);
+                        oplog::emit(json!({"sweep": "repo-failed", "repo": repo.full_name,
+                                           "err": trunc(&e.to_string(), 150)}));
+                        continue;
+                    }
                 }
             }
+        }
+        if let Some((repos, err)) = scans.all_failed() {
+            emit_scan_failed_everywhere(repos, err);
         }
 
         if scan_complete && let Err(e) = self.reap_zombies(&registered).await {
@@ -286,5 +338,33 @@ mod tests {
     fn deadline_low_under_15s() {
         assert!(Deadline::from_fn(|| 14_999).low());
         assert!(!Deadline::from_fn(|| 15_000).low());
+    }
+
+    #[test]
+    fn scan_tally_fires_only_when_all_attempts_failed() {
+        let err = GithubError::Status {
+            status: 403,
+            endpoint: "first".to_string(),
+        };
+        let later = GithubError::Status {
+            status: 500,
+            endpoint: "second".to_string(),
+        };
+
+        // Nothing attempted: no line (the repos:0 case is the installations
+        // failure, handled at its call site).
+        assert!(ScanTally::default().all_failed().is_none());
+
+        let mut tally = ScanTally::default();
+        tally.failed(&err);
+        tally.failed(&later);
+        let (repos, first) = tally.all_failed().expect("all failed");
+        assert_eq!(repos, 2);
+        assert!(first.contains("first"), "keeps the FIRST error: {first}");
+
+        let mut tally = ScanTally::default();
+        tally.failed(&err);
+        tally.succeeded();
+        assert!(tally.all_failed().is_none(), "one success silences it");
     }
 }

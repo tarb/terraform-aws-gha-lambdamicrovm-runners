@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -24,6 +24,9 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 thiserror = "2"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
 aws-sdk-lambdamicrovms = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+# Idle reports: the VM invokes the dispatcher directly (plain Lambda Invoke
+# works over PrivateLink where the MicroVMs sub-API does not).
+aws-sdk-lambda = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
 aws-sdk-ssm = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
 aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
 aws-sdk-eventbridge = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }

@@ -1,6 +1,11 @@
 //! Self-termination: terminate THIS MicroVM now so billing stops
 //! immediately. LOUD and retried — a silently failing call leaves the VM
 //! billing until max-duration.
+//!
+//! Since v0.0.3 this is the FALLBACK behind [`crate::report`]: idle VMs
+//! first report to the dispatcher (in-guest `TerminateMicrovm` always fails
+//! behind a PrivateLink Lambda endpoint), and only a failed/impossible
+//! report lands here.
 
 use crate::aws::CloudControl;
 use crate::logfmt::{log, truncate_chars};

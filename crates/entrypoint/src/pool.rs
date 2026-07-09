@@ -7,9 +7,10 @@ use crate::handoff::{self, HandoffAddress};
 use crate::logfmt::log;
 use crate::payload::{RunConfig, lenient};
 use crate::state::AppState;
-use crate::{docker, supervisor, terminate};
+use crate::{docker, report, supervisor};
 use std::sync::Arc;
 use std::time::Duration;
+use types::IdleReason;
 
 /// Wall/monotonic clock pair, injectable for tests.
 pub trait Clock: Send + Sync {
@@ -159,9 +160,14 @@ async fn idle_wait_with(app: Arc<AppState>, cfg: &RunConfig, mut watch: crate::g
         return;
     }
     log(format!(
-        "pool: not suspended or reused within {grace}s - self-terminating"
+        "pool: not suspended or reused within {grace}s - reporting orphan"
     ));
-    terminate::self_terminate(&*app.aws, cfg.microvm_id.as_ref(), &app.region).await;
+    // Nothing suspended or reused us: report as an orphan — the dispatcher
+    // terminates it from the control plane (we return right after this, so
+    // pooling us would leave a suspended VM that could never claim a
+    // handoff) — falling back to the in-VM self-terminate when reporting is
+    // impossible.
+    report::report_idle_or_terminate(&*app.aws, cfg, &app.region, IdleReason::Orphan).await;
 }
 
 #[cfg(test)]
@@ -367,9 +373,37 @@ mod tests {
         }));
         let watch = app.gate.watch_runs();
         idle_wait_with(app, &cfg, watch).await;
-        // The final claim was attempted, found nothing, and we terminated.
+        // The final claim was attempted, found nothing; no dispatcher_fn in
+        // the payload (old dispatcher), so we self-terminated as before.
         assert_eq!(fake.gets.lock().unwrap().as_slice(), ["/p/microvm-x"]);
         assert!(fake.deletes.lock().unwrap().is_empty());
+        assert!(fake.invokes.lock().unwrap().is_empty());
         assert_eq!(fake.terminated.lock().unwrap().as_slice(), ["microvm-x"]);
+    }
+
+    #[tokio::test]
+    async fn grace_expiry_reports_orphan_instead_of_terminating() {
+        // With a dispatcher_fn in the payload the expiry path reports
+        // reason=orphan and leaves the teardown to the dispatcher.
+        let (app, fake) = test_app("/nonexistent");
+        let cfg = RunConfig::from_value(json!({
+            "pool": true, "pool_grace": "0", "microvmId": "microvm-x",
+            "handoff_prefix": "/p", "dispatcher_fn": "disp",
+        }));
+        let watch = app.gate.watch_runs();
+        idle_wait_with(app, &cfg, watch).await;
+        let invokes = fake.invokes.lock().unwrap();
+        assert_eq!(invokes.len(), 1);
+        assert_eq!(invokes[0].0, "disp");
+        let event: serde_json::Value = serde_json::from_str(&invokes[0].1).unwrap();
+        assert_eq!(
+            event,
+            json!({"idle": {"microvmId": "microvm-x", "reason": "orphan"}})
+        );
+        drop(invokes);
+        assert!(
+            fake.terminated.lock().unwrap().is_empty(),
+            "an accepted report must not be followed by a terminate"
+        );
     }
 }

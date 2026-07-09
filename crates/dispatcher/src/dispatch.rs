@@ -60,9 +60,17 @@ impl Dispatcher {
     }
 
     pub async fn dispatch(&self, job: &JobRef) -> Result<(), DispatchError> {
-        if self.cfg.max_concurrency != 0
-            && self.fleet.running_count().await? >= self.cfg.max_concurrency
-        {
+        // ONE fleet listing per dispatch, shared by the cap gate and the
+        // pool candidate scan: a webhook burst is N parallel invokes, and
+        // doubled ListMicrovms calls are what throttled the control plane.
+        // Freshness rides on try_resume's per-candidate GetMicrovm re-check,
+        // not on re-listing. Throttle-retried — see Fleet::retry_throttle.
+        let vms = if self.cfg.max_concurrency != 0 || self.cfg.pool_enabled {
+            self.fleet.retry_throttle(|| self.fleet.list()).await?
+        } else {
+            Vec::new()
+        };
+        if self.cfg.max_concurrency != 0 && Fleet::count_running(&vms) >= self.cfg.max_concurrency {
             let err = DispatchError::CapReached {
                 cap: self.cfg.max_concurrency,
                 job: job.job_id,
@@ -86,7 +94,10 @@ impl Dispatcher {
                 u64::try_from(self.cfg.pool_suspend_grace).unwrap_or(0),
                 &self.cfg.handoff_prefix,
             );
-            if let ResumeOutcome::Resumed = self.pool.try_resume(&payload).await? {
+            // Pooled VMs report their idleness back by direct invoke (both
+            // the cold-launch and mailbox-handoff copies carry this).
+            payload.dispatcher_fn = self.cfg.dispatcher_fn.clone();
+            if let ResumeOutcome::Resumed = self.pool.try_resume(&payload, &vms).await? {
                 return Ok(());
             }
         }

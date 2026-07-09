@@ -28,6 +28,15 @@ impl AwsApiError {
     pub fn is_code(&self, code: &str) -> bool {
         matches!(self, AwsApiError::Service { code: Some(c), .. } if c == code)
     }
+
+    /// A control-plane throttle response: retryable with backoff. Both codes
+    /// the lambda-microvms API models for "slow down" — `ThrottlingException`
+    /// (the observed one; modeled retryable in the SDK) and
+    /// `TooManyRequestsException` (modeled, but WITHOUT the retryable trait,
+    /// so the SDK's own retry only catches it via its error-code list).
+    pub fn is_throttle(&self) -> bool {
+        self.is_code("ThrottlingException") || self.is_code("TooManyRequestsException")
+    }
 }
 
 /// Swallow service errors, propagate transport errors — for best-effort
@@ -81,6 +90,14 @@ mod tests {
         assert!(service("AccessDeniedException").is_code("AccessDeniedException"));
         assert!(!service("Other").is_code("AccessDeniedException"));
         assert!(!AwsApiError::Transport("boom".into()).is_code("AccessDeniedException"));
+    }
+
+    #[test]
+    fn throttle_classification_covers_both_modeled_codes() {
+        assert!(service("ThrottlingException").is_throttle());
+        assert!(service("TooManyRequestsException").is_throttle());
+        assert!(!service("AccessDeniedException").is_throttle());
+        assert!(!AwsApiError::Transport("boom".into()).is_throttle());
     }
 
     #[test]

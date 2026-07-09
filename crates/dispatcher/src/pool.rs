@@ -7,17 +7,22 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use types::{MicrovmId, RunPayload, RunnerName};
+use types::{IdleReason, IdleReport, MicrovmId, RunPayload, RunnerName};
 
 use crate::aws::{AwsApiError, ignore_service};
 use crate::clock::{Clock, Epoch};
 use crate::dispatch::DispatchError;
-use crate::fleet::{Fleet, MicrovmState};
+use crate::fleet::{Fleet, MicrovmState, VmRecord};
 use crate::github::GithubApi;
 use crate::github::GithubError;
+use crate::github::types::InstallationId;
 use crate::intake::webhook::WebhookPayload;
 use crate::mailbox::{ClaimStatus, Mailbox};
 use crate::oplog::{self, trunc};
+
+/// How long after a resume this container distrusts idle reports for the
+/// resumed VM (the pre-suspend guest's report can thaw and arrive late).
+const RESUME_GUARD: Duration = Duration::from_secs(60);
 
 /// VM ids this container resumed recently; the sweep's zombie reaper skips
 /// them while their re-registration is in flight.
@@ -71,15 +76,35 @@ pub enum ResumeOutcome {
     Abandoned,
 }
 
-/// What the suspend intake decided. Rendered into the webhook response.
+/// What the suspend intake decided. Rendered into the webhook (or idle
+/// direct-invoke) response.
 #[derive(Debug, PartialEq)]
 pub enum IntakeOutcome {
     PoolDisabled,
-    NotOurs { runner: String },
-    AlreadyGone { runner: String },
+    NotOurs {
+        runner: String,
+    },
+    AlreadyGone {
+        runner: String,
+    },
     AlreadySuspended,
+    /// Idle report for a VM that is neither RUNNING nor a state we can name
+    /// an outcome for — skipped.
+    NotRunning {
+        state: String,
+    },
+    /// Idle report for a VM this container resumed moments ago: the report
+    /// belongs to the pre-suspend guest and the resume's job owns the VM.
+    RecentlyResumed,
     PoolFull,
     RunnerBusy,
+    /// Idle report from a stale-image VM: it could never be safely resumed,
+    /// so it is terminated instead of pooled.
+    StaleImage,
+    /// `reason=orphan` idle report: terminated. An orphan's guest returns
+    /// from its idle wait right after reporting, so a suspended orphan could
+    /// never claim a handoff — pooling it would be a dead slot.
+    OrphanTerminated,
     Suspended,
     BenignError,
 }
@@ -91,8 +116,12 @@ impl fmt::Display for IntakeOutcome {
             Self::NotOurs { runner } => write!(f, "not ours: {runner:?}"),
             Self::AlreadyGone { runner } => write!(f, "vm for {runner} already gone"),
             Self::AlreadySuspended => f.write_str("already suspended"),
+            Self::NotRunning { state } => write!(f, "vm not RUNNING ({state}) - skipped"),
+            Self::RecentlyResumed => f.write_str("recently resumed - skipped"),
             Self::PoolFull => f.write_str("pool full - terminated"),
             Self::RunnerBusy => f.write_str("runner busy with a new job - not suspending"),
+            Self::StaleImage => f.write_str("stale image - terminated"),
+            Self::OrphanTerminated => f.write_str("orphan - terminated"),
             Self::Suspended => f.write_str("suspended"),
             Self::BenignError => f.write_str("error (benign)"),
         }
@@ -107,6 +136,22 @@ enum PoolIntakeError {
     Aws(#[from] AwsApiError),
     #[error(transparent)]
     Github(#[from] GithubError),
+    /// Image-version resolution (the idle stale-image check).
+    #[error(transparent)]
+    Dispatch(#[from] DispatchError),
+}
+
+/// What triggered a suspend-or-terminate decision for a finished VM.
+enum IntakeSource<'a> {
+    /// A `workflow_job` completed webhook. It races the VM's own post-job
+    /// cleanup, so the suspend is delayed; the VM is found by runner name and
+    /// the busy-check has the webhook's repo to ask.
+    Completed(&'a WebhookPayload),
+    /// A direct idle report from the VM itself, sent AFTER its own cleanup —
+    /// no delay; the VM names itself, and the busy-check asks the report's
+    /// repo hint when present (falling back to a bounded scan of the App's
+    /// repos for the derived runner name).
+    Idle(&'a IdleReport),
 }
 
 pub struct Pool {
@@ -139,11 +184,18 @@ impl Pool {
 
     /// The pull-handoff resume: pick ONE suspended current-image VM, park the
     /// payload in its mailbox BEFORE resuming, then poll for the parameter's
-    /// disappearance (delete == ack).
-    pub async fn try_resume(&self, payload: &RunPayload) -> Result<ResumeOutcome, DispatchError> {
+    /// disappearance (delete == ack). `vms` is the dispatch's ONE shared
+    /// fleet listing (the cap gate used it too) — it may be stale, and that
+    /// is fine: every candidate is re-verified with a fresh GetMicrovm below
+    /// before anything state-changing happens.
+    pub async fn try_resume(
+        &self,
+        payload: &RunPayload,
+        vms: &[VmRecord],
+    ) -> Result<ResumeOutcome, DispatchError> {
         let current = self.fleet.current_image_version().await?;
         let now = self.clock.now();
-        for vm in self.fleet.list().await? {
+        for vm in vms {
             if vm.state != MicrovmState::Suspended {
                 continue;
             }
@@ -160,7 +212,11 @@ impl Pool {
             }
             // Fresh state read: the listing may be stale. Failures here move
             // to the NEXT candidate — one bad VM must not wedge the pool.
-            match self.fleet.state_of(&vm.id).await {
+            match self
+                .fleet
+                .retry_throttle(|| self.fleet.state_of(&vm.id))
+                .await
+            {
                 Ok(MicrovmState::Suspended) => {}
                 // Raced: another invocation claimed it — not ours to touch.
                 Ok(_) => continue,
@@ -181,7 +237,11 @@ impl Pool {
                 }
                 Err(e) => return Err(e.into()),
             };
-            if let Err(e) = self.fleet.resume(&vm.id).await {
+            if let Err(e) = self
+                .fleet
+                .retry_throttle(|| self.fleet.resume(&vm.id))
+                .await
+            {
                 if !e.is_service() {
                     return Err(e.into());
                 }
@@ -216,7 +276,10 @@ impl Pool {
     /// Suspend intake for completed jobs. NEVER errors — the completed event
     /// is advisory; any failure is logged and reported as benign.
     pub async fn intake_completed(&self, payload: &WebhookPayload) -> IntakeOutcome {
-        match self.intake_completed_inner(payload).await {
+        if !self.policy.enabled {
+            return IntakeOutcome::PoolDisabled;
+        }
+        match self.intake_inner(&IntakeSource::Completed(payload)).await {
             Ok(outcome) => outcome,
             Err(e) => {
                 oplog::emit(json!({"pool": "completed-intake-error",
@@ -226,56 +289,138 @@ impl Pool {
         }
     }
 
-    async fn intake_completed_inner(
+    /// Intake for a VM's direct idle report. NEVER errors, like
+    /// [`Self::intake_completed`]. Runs even with the pool disabled: the VM
+    /// asked to be dealt with, and "no room" then terminates it. Only
+    /// `reason=job-complete` may suspend into the pool; `reason=orphan`
+    /// always terminates (see the orphan branch in `intake_inner`).
+    pub async fn intake_idle(&self, report: &IdleReport) -> IntakeOutcome {
+        oplog::emit(json!({"pool": "idle-report",
+                           "microvmId": report.microvm_id,
+                           "reason": report.reason.as_str()}));
+        // A VM we resumed within the last minute is mid-handoff: its report
+        // was sent by the PRE-suspend guest (frozen mid-report, thawed now)
+        // and the new run owns the VM — acting on it would kill a live job.
+        // The ledger is per-container: a resume by ANOTHER dispatcher
+        // container is not seen here and rides on the busy/RUNNING checks
+        // below instead — acceptable, this guard just closes the window the
+        // busy check cannot (the resumed job may not have re-registered yet).
+        if self
+            .ledger
+            .recently(&MicrovmId::new(report.microvm_id.as_str()), RESUME_GUARD)
+        {
+            oplog::emit(json!({"pool": "idle-skip",
+                               "microvmId": report.microvm_id,
+                               "why": "recently-resumed"}));
+            return IntakeOutcome::RecentlyResumed;
+        }
+        match self.intake_inner(&IntakeSource::Idle(report)).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                oplog::emit(json!({"pool": "idle-intake-error",
+                                   "err": trunc(&e.to_string(), 200)}));
+                IntakeOutcome::BenignError
+            }
+        }
+    }
+
+    /// The shared suspend-or-terminate flow behind both intakes.
+    async fn intake_inner(
         &self,
-        payload: &WebhookPayload,
+        source: &IntakeSource<'_>,
     ) -> Result<IntakeOutcome, PoolIntakeError> {
-        if !self.policy.enabled {
-            return Ok(IntakeOutcome::PoolDisabled);
-        }
-        let runner = payload.runner_name().to_string();
-        let Some(ours) = RunnerName::parse(&runner) else {
-            return Ok(IntakeOutcome::NotOurs { runner });
+        // Locate and validate the VM — by runner name (webhook) or by its
+        // own id (idle report; skip-with-a-log unless it is RUNNING).
+        // NotOurs is decided BEFORE the fleet list: most completed webhooks
+        // are for runners that aren't ours and must stay AWS-call-free.
+        let (vm, vms) = match source {
+            IntakeSource::Completed(payload) => {
+                let runner = payload.runner_name().to_string();
+                let Some(ours) = RunnerName::parse(&runner) else {
+                    return Ok(IntakeOutcome::NotOurs { runner });
+                };
+                let vms = self.fleet.list().await?;
+                let Some(vm) = vms
+                    .iter()
+                    .find(|v| v.id.as_str().contains(ours.fragment))
+                    .cloned()
+                else {
+                    return Ok(IntakeOutcome::AlreadyGone { runner });
+                };
+                if vm.state.pooled() {
+                    return Ok(IntakeOutcome::AlreadySuspended);
+                }
+                if vm.state.gone() {
+                    return Ok(IntakeOutcome::AlreadyGone { runner });
+                }
+                (vm, vms)
+            }
+            IntakeSource::Idle(report) => {
+                let vms = self.fleet.list().await?;
+                let Some(vm) = vms
+                    .iter()
+                    .find(|v| v.id.as_str() == report.microvm_id)
+                    .cloned()
+                else {
+                    oplog::emit(json!({"pool": "idle-skip",
+                                       "microvmId": report.microvm_id,
+                                       "state": "gone"}));
+                    return Ok(IntakeOutcome::AlreadyGone {
+                        runner: report.microvm_id.clone(),
+                    });
+                };
+                if vm.state != MicrovmState::Running {
+                    let state = format!("{:?}", vm.state);
+                    oplog::emit(json!({"pool": "idle-skip",
+                                       "microvmId": report.microvm_id,
+                                       "state": state}));
+                    return Ok(if vm.state.pooled() {
+                        IntakeOutcome::AlreadySuspended
+                    } else if vm.state.gone() {
+                        IntakeOutcome::AlreadyGone {
+                            runner: report.microvm_id.clone(),
+                        }
+                    } else {
+                        IntakeOutcome::NotRunning { state }
+                    });
+                }
+                (vm, vms)
+            }
         };
-        let vms = self.fleet.list().await?;
-        let Some(vm) = vms
-            .iter()
-            .find(|v| v.id.as_str().contains(ours.fragment))
-            .cloned()
-        else {
-            return Ok(IntakeOutcome::AlreadyGone { runner });
-        };
-        if vm.state.pooled() {
-            return Ok(IntakeOutcome::AlreadySuspended);
+
+        let pooled = pooled_count(&vms);
+        if let IntakeSource::Completed(_) = source {
+            if pooled >= self.policy.max_size {
+                return self.terminate_full(&vm).await;
+            }
+            // Webhook path only: the completed event races the entrypoint's
+            // own post-job cleanup — wait it out before freezing. (An idle
+            // report is sent AFTER cleanup, so it skips the delay.)
+            self.clock.sleep(self.policy.suspend_delay).await;
+            // Re-check the cap AFTER the delay: N jobs completing together
+            // all pass the pre-sleep check and would overshoot the pool by N.
+            if pooled_count(&self.fleet.list().await?) >= self.policy.max_size {
+                return self.terminate_full(&vm).await;
+            }
         }
-        if vm.state.gone() {
-            return Ok(IntakeOutcome::AlreadyGone { runner });
-        }
-        let pooled = vms.iter().filter(|v| v.state.pooled()).count() as i64;
-        if pooled >= self.policy.max_size {
-            oplog::emit(json!({"pool": "full-terminating", "microvmId": vm.id}));
-            ignore_service(self.fleet.terminate(&vm.id).await)?;
-            return Ok(IntakeOutcome::PoolFull);
-        }
-        // Let the entrypoint finish post-job cleanup before freezing it.
-        self.clock.sleep(self.policy.suspend_delay).await;
-        // Re-check the cap AFTER the delay: N jobs completing together all
-        // pass the pre-sleep check and would overshoot the pool by N.
-        let pooled_after = self
-            .fleet
-            .list()
-            .await?
-            .iter()
-            .filter(|v| v.state.pooled())
-            .count() as i64;
-        if pooled_after >= self.policy.max_size {
-            oplog::emit(json!({"pool": "full-terminating", "microvmId": vm.id}));
-            ignore_service(self.fleet.terminate(&vm.id).await)?;
-            return Ok(IntakeOutcome::PoolFull);
-        }
+
         // A duplicate/late event must not freeze a VM that took a NEW job:
         // the reused VM re-registers the SAME runner name, so busy == in use.
-        match self.runner_busy(payload, &runner).await {
+        let busy = match source {
+            IntakeSource::Completed(payload) => {
+                self.runner_busy(payload, payload.runner_name()).await
+            }
+            IntakeSource::Idle(report) => {
+                let runner = RunnerName::for_vm(&vm.id);
+                match report.repo.as_deref() {
+                    // The report named its repo: one scoped listing, exactly
+                    // like the completed path.
+                    Some(repo) => self.runner_busy_in(repo, None, runner.as_str()).await,
+                    None => self.runner_busy_anywhere(runner.as_str()).await,
+                }
+            }
+        };
+        match busy {
             Ok(true) => return Ok(IntakeOutcome::RunnerBusy),
             Ok(false) => {}
             Err(e) => {
@@ -284,9 +429,50 @@ impl Pool {
                                    "err": trunc(&e.to_string(), 150)}));
             }
         }
+
+        if let IntakeSource::Idle(report) = source {
+            // An orphan ALWAYS terminates (busy VMs were skipped above). Its
+            // guest returns the moment the report is answered — it never
+            // re-enters the idle wait — so a suspended orphan could never
+            // claim a handoff: a dead pool slot that blocks a live one.
+            // (A job-complete guest re-enters the idle wait after reporting
+            // and CAN claim later handoffs, so only it may pool.) Adoption
+            // is future work: it needs a guest wait-after-report handshake.
+            if report.reason == IdleReason::Orphan {
+                oplog::emit(json!({"pool": "terminate-orphan", "microvmId": vm.id}));
+                ignore_service(self.fleet.terminate(&vm.id).await)?;
+                return Ok(IntakeOutcome::OrphanTerminated);
+            }
+            // A stale-image VM could never be safely resumed: terminate.
+            let current = self.fleet.current_image_version().await?;
+            if vm.stale_image(&current) {
+                oplog::emit(json!({"pool": "terminate-stale", "microvmId": vm.id}));
+                ignore_service(self.fleet.terminate(&vm.id).await)?;
+                return Ok(IntakeOutcome::StaleImage);
+            }
+            // A disabled pool has room for nothing.
+            if !self.policy.enabled || pooled >= self.policy.max_size {
+                return self.terminate_full(&vm).await;
+            }
+            // That count rode the intake's FIRST listing, and the busy/stale
+            // checks above are real network time: re-list immediately before
+            // the freeze so N racing idle reports can't overshoot the cap by
+            // N (mirrors the completed path's post-delay re-check).
+            if pooled_count(&self.fleet.list().await?) >= self.policy.max_size {
+                return self.terminate_full(&vm).await;
+            }
+        }
+
         self.fleet.suspend(&vm.id).await?;
         oplog::emit(json!({"pool": "suspended", "microvmId": vm.id}));
         Ok(IntakeOutcome::Suspended)
+    }
+
+    /// Pool-full teardown, shared by both intakes.
+    async fn terminate_full(&self, vm: &VmRecord) -> Result<IntakeOutcome, PoolIntakeError> {
+        oplog::emit(json!({"pool": "full-terminating", "microvmId": vm.id}));
+        ignore_service(self.fleet.terminate(&vm.id).await)?;
+        Ok(IntakeOutcome::PoolFull)
     }
 
     async fn runner_busy(
@@ -297,13 +483,45 @@ impl Pool {
         let Some(repo) = payload.repo() else {
             return Ok(false);
         };
-        let token = self
-            .github
-            .token_for_repo(repo, payload.installation_id())
-            .await?;
+        self.runner_busy_in(repo, payload.installation_id(), runner)
+            .await
+    }
+
+    /// Repo-scoped busy probe: one runner listing in `repo`. The
+    /// installation id is optional — `token_for_repo` derives it from the
+    /// repo when absent (idle reports carry a repo hint, no installation).
+    async fn runner_busy_in(
+        &self,
+        repo: &str,
+        installation: Option<InstallationId>,
+        runner: &str,
+    ) -> Result<bool, GithubError> {
+        let token = self.github.token_for_repo(repo, installation).await?;
         let runners = self.github.repo_runners(repo, &token).await?;
         Ok(runners.iter().any(|r| r.name == runner && r.busy))
     }
+
+    /// Busy probe with no repo hint (idle reports carry only the VM id):
+    /// walk the App's installations' repos — bounded like the sweep — until
+    /// the runner name is found. A name registers in exactly one repo, so
+    /// the first hit decides.
+    async fn runner_busy_anywhere(&self, runner: &str) -> Result<bool, GithubError> {
+        for inst in self.github.installations().await?.iter().take(10) {
+            let (token, repos) = self.github.installation_repos(*inst).await?;
+            for repo in repos.iter().take(100) {
+                let runners = self.github.repo_runners(&repo.full_name, &token).await?;
+                if let Some(r) = runners.iter().find(|r| r.name == runner) {
+                    return Ok(r.busy);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// SUSPENDED + SUSPENDING — what occupies warm-pool slots.
+fn pooled_count(vms: &[VmRecord]) -> i64 {
+    vms.iter().filter(|v| v.state.pooled()).count() as i64
 }
 
 /// Round to one decimal for the `handoff_seconds` log value.

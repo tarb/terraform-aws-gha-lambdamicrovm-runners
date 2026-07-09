@@ -18,6 +18,32 @@ use crate::oplog;
 /// Resolved latest-ACTIVE image version is re-checked at most this often.
 const IMAGE_TTL: Duration = Duration::from_secs(60);
 
+/// Throttle-retry envelope for dispatch-path control-plane calls: total
+/// attempts, full-jitter base, and the per-gap ceiling. Worst case is
+/// ~3.5 s of sleep (0.5 + 1 + 2) — well inside the invoke budget.
+const THROTTLE_MAX_ATTEMPTS: u32 = 4;
+const THROTTLE_BASE: Duration = Duration::from_millis(500);
+const THROTTLE_GAP_CAP: Duration = Duration::from_secs(4);
+
+/// Uniform-ish in [0, 1) without a rand dependency: jitter needs spread,
+/// not quality, and `RandomState`'s per-instance keys give exactly that.
+fn jitter01() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    let h = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    (h >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Full-jitter gap after the `attempt`-th throttled failure (1-indexed):
+/// uniform over (0, min(base * 2^(attempt-1), cap)).
+fn throttle_gap(attempt: u32) -> Duration {
+    let ceiling = THROTTLE_BASE
+        .saturating_mul(1u32 << (attempt - 1).min(16))
+        .min(THROTTLE_GAP_CAP);
+    Duration::from_secs_f64(ceiling.as_secs_f64() * jitter01())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MicrovmState {
     Pending,
@@ -142,10 +168,13 @@ impl Fleet {
     }
 
     /// PENDING/RUNNING hold capacity; unknown states are logged, not counted.
-    pub async fn running_count(&self) -> Result<i64, AwsApiError> {
+    /// Takes an already-fetched listing: the dispatch path shares ONE
+    /// `ListMicrovms` result between this cap count and the pool candidate
+    /// scan instead of listing twice.
+    pub fn count_running(vms: &[VmRecord]) -> i64 {
         let mut n = 0i64;
         let mut unknown: BTreeSet<String> = BTreeSet::new();
-        for vm in self.list().await? {
+        for vm in vms {
             if vm.state.holds_capacity() {
                 n += 1;
             } else if let MicrovmState::Other(s) = &vm.state
@@ -161,7 +190,39 @@ impl Fleet {
                 "states": states,
             }));
         }
-        Ok(n)
+        n
+    }
+
+    /// Bounded full-jitter retry for throttled control-plane calls, used on
+    /// the dispatch path only. A webhook burst is N parallel invokes hitting
+    /// a low-TPS API in lockstep; the SDK's own standard retry (3 attempts,
+    /// 1 s base — see main.rs) already ran INSIDE each failed call and lost
+    /// the same synchronized race, so this widens the envelope rather than
+    /// failing the job onto the 5-minute sweep cadence. Emits one
+    /// `{"pool": "throttled", "calls": N}` line per burst that needed
+    /// retries; a non-throttle error or exhaustion surfaces unchanged.
+    pub async fn retry_throttle<T, F, Fut>(&self, op: F) -> Result<T, AwsApiError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, AwsApiError>>,
+    {
+        let mut throttled = 0u32;
+        let result = loop {
+            match op().await {
+                Err(e) if e.is_throttle() => {
+                    throttled += 1;
+                    if throttled >= THROTTLE_MAX_ATTEMPTS {
+                        break Err(e);
+                    }
+                    self.clock.sleep(throttle_gap(throttled)).await;
+                }
+                other => break other,
+            }
+        };
+        if throttled > 0 {
+            oplog::emit(json!({"pool": "throttled", "calls": throttled}));
+        }
+        result
     }
 
     /// The version to launch/resume against: the env pin wins; otherwise the
@@ -265,6 +326,18 @@ mod tests {
             MicrovmState::parse("weird"),
             MicrovmState::Other("WEIRD".into())
         );
+    }
+
+    #[test]
+    fn throttle_gaps_respect_the_exponential_ceiling_and_cap() {
+        for _ in 0..100 {
+            assert!(throttle_gap(1) <= Duration::from_millis(500));
+            assert!(throttle_gap(2) <= Duration::from_secs(1));
+            assert!(throttle_gap(3) <= Duration::from_secs(2));
+            // Beyond the doubling range the per-gap cap holds.
+            assert!(throttle_gap(10) <= Duration::from_secs(4));
+            assert!(throttle_gap(u32::MAX) <= Duration::from_secs(4));
+        }
     }
 
     #[test]

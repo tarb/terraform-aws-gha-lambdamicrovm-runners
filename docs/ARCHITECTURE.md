@@ -213,9 +213,11 @@ The `/run` handler supports **two modes**, chosen by the payload:
   JIT blob can't ride in `runHookPayload` (the service caps it at 4096 bytes,
   despite the doc string saying 16 KB), so we pass a small token and register on-box.
 
-When the (ephemeral) runner process exits, `terminate_self()` calls
-`TerminateMicrovm` on the VM's **own** `microvmId` (delivered
-in the `/run` body) - see [cost / self-terminate](#53-cost-model--self-termination).
+When the (ephemeral) runner process exits, the supervisor reports its
+idleness to the dispatcher (when the `/run` payload named it via
+`dispatcher_fn`), falling back to `terminate_self()` — `TerminateMicrovm` on
+the VM's **own** `microvmId` (delivered in the `/run` body) - see
+[cost / self-terminate](#53-cost-model--self-termination).
 
 `dockerd` is started **fresh per job** (not baked into the snapshot) - see
 [Docker + DNS](#52-docker-in-runner--the-dns-fix). `start_runner()` warms it up in a
@@ -263,7 +265,7 @@ Role names below are the defaults for `name_prefix = "gha-microvm"`; each role i
 | Role | Trust | Permissions |
 |---|---|---|
 | **`gha-microvm-build-role`** | `lambda.amazonaws.com` (+ `aws:SourceAccount` condition) | S3 read artifact / write build output on the artifacts bucket; CloudWatch logs. Used **during image build**. |
-| **`gha-microvm-exec-role`** | same | CloudWatch logs **+ `lambda:TerminateMicrovm`** (so the VM can self-terminate). Assumed **at runtime** by the MicroVM. |
+| **`gha-microvm-exec-role`** | same | CloudWatch logs **+ `lambda:InvokeFunction` on the dispatcher** (idle reports) **+ `lambda:TerminateMicrovm`** (self-terminate fallback). Assumed **at runtime** by the MicroVM. |
 | **`gha-microvm-dispatcher-role`** | `lambda.amazonaws.com` | `lambda:RunMicrovm/TerminateMicrovm/GetMicrovm/ListMicrovms`; `lambda:PassNetworkConnector` (the egress connector); `iam:PassRole` (the exec role only); `ssm:GetParameter` + `kms:Decrypt` (the dispatcher parameter). |
 
 Least-privilege notes: the exec role's `TerminateMicrovm` is `Resource:"*"` (IAM
@@ -370,13 +372,28 @@ e.g. a 3-minute job billed for a 20-minute idle tail. At e.g. ~50 jobs/day that 
 has none (it only polls GitHub *outbound*) - an `idlePolicy` would suspend it
 **mid-job**. Wrong tool.
 
-**The fix:** when the ephemeral runner process exits, the entrypoint supervisor's
-`terminate_self()` calls `TerminateMicrovm` on the VM's own
-`microvmId`. (Self-*terminate* is allowed - only self-*suspend* isn't, because
-suspend must snapshot the still-running caller.) Result: VM lifetime drops
-from the max-duration cap to **≈ the real job length** — for short jobs an
-**~85% cut** in billed runtime. `maximumDurationInSeconds` stays as a hard backstop in
-case the call ever fails.
+**The fix — report, then fall back:** when the ephemeral runner process exits
+(and post-job cleanup is done), the entrypoint supervisor first **reports its
+idleness to the dispatcher** with a direct Lambda invoke
+(`{"idle": {"microvmId": "...", "reason": "job-complete"|"orphan"}}`,
+RequestResponse, 2 attempts); the dispatcher then suspends the VM into the
+warm pool (room permitting) or terminates it **from the control plane**.
+Only when reporting is impossible (no `dispatcher_fn` in the run payload —
+an old dispatcher) or fails outright does the VM fall back to the in-VM
+`terminate_self()` (`TerminateMicrovm` on its own `microvmId`), which itself
+falls back to the sweep reaper / max-duration backstop.
+
+**Why the indirection?** In a VPC whose Lambda API traffic rides a
+**PrivateLink interface endpoint**, in-VM `TerminateMicrovm` **always
+fails** — the MicroVMs sub-API rejects PrivateLink with
+`AccessDeniedException` "PrivateLink is not yet supported". A standard
+Lambda `Invoke` works fine over PrivateLink, so the VM asks the dispatcher
+to act where everything works. (Self-*terminate* is otherwise allowed - only
+self-*suspend* isn't, because suspend must snapshot the still-running
+caller.) Result: VM lifetime drops from the max-duration cap to **≈ the real
+job length** — for short jobs an **~85% cut** in billed runtime.
+`maximumDurationInSeconds` stays as a hard backstop in case every layer of
+the chain fails.
 
 ### 5.4 Ephemeral vs persistent runners
 
@@ -604,6 +621,17 @@ aws lambda-microvms terminate-microvm --region <your-region> --microvm-identifie
 - **Confused-deputy**: build/exec trust policies pin `aws:SourceAccount`.
 - **Snapshot hygiene**: never bake credentials/identity into the image; inject
   per-VM via `runHookPayload`. Reseed any CSPRNG on `/resume`.
+- **Idle-report control edge**: every runner VM can invoke the dispatcher
+  (`lambda:InvokeFunction` on the dispatcher function, for idle reports), so a
+  compromised job could report *any* VM id idle and nudge the dispatcher into
+  suspending or terminating it. This is the **same trust domain** as the
+  `lambda:TerminateMicrovm` `Resource: "*"` grant every VM already holds — a
+  hostile VM can already kill fleet members directly, so the report path adds
+  no new privilege. The guards are the dispatcher's own checks: only RUNNING
+  VMs are acted on, and a busy runner (per GitHub) is never frozen or killed.
+  Possible future hardening: a payload-embedded per-VM authenticator (a
+  secret delivered in `runHookPayload` and echoed back in the report) so the
+  dispatcher can verify a report really comes from the VM it names.
 - **Further hardening**: deliver a single-use **JIT config via S3** so no
   reusable installation token ever lands inside the VM; tighten egress to a VPC
   connector with an `lambda-microvms` VPC endpoint.
@@ -636,9 +664,13 @@ jobs against the fleet and GCs suspended VMs on stale image versions. DLQ +
 job was already taken get no work and the idle watchdog reaps them.
 
 Pool lifecycle (entrypoint): job exits → dockerd teardown + `_work` wipe →
-wait for dispatcher suspend; a wall-clock jump against monotonic time marks
-resume (grace resets, new `/run` re-registers a fresh ephemeral runner with
-the new job's token); never suspended → self-terminate (backstop).
+idle report (`reason=job-complete`) to the dispatcher, whose suspend then
+arrives in seconds (the completed webhook stays as backup) → wait for the
+suspend; a wall-clock jump against monotonic time marks resume (grace
+resets, new `/run` re-registers a fresh ephemeral runner with the new job's
+token); never suspended → idle report (`reason=orphan` — the dispatcher
+terminates it from the control plane; an orphan's guest never re-enters the
+idle wait, so it is never pooled) → self-terminate (backstop).
 
 API shapes (`ListMicrovms` → `items`, `microvmIdentifier=` params, endpoint +
 `X-aws-proxy-auth` token from `CreateMicrovmAuthToken` for the resume `/run`)

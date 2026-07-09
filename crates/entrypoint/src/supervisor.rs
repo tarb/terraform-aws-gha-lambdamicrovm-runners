@@ -5,7 +5,7 @@ use crate::logfmt::log;
 use crate::payload::RunConfig;
 use crate::registration::{LaunchError, LaunchPlan, PreparedRunner};
 use crate::state::AppState;
-use crate::{pool, terminate};
+use crate::{pool, report};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use reqwest::Method;
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
+use types::IdleReason;
 
 /// Spawn `run_task` detached. Boxed dyn future to break the
 /// run_task -> pool_idle_wait -> run_task type recursion.
@@ -41,9 +42,10 @@ pub async fn run_task(app: Arc<AppState>, cfg: RunConfig) {
         log(format!("start_runner error: {e}"));
         if cfg.pool {
             // A pooled VM whose run flow failed has NO reaper (no job -> no
-            // completed event; no runner -> no watchdog): terminate, never
-            // idle.
-            terminate::self_terminate(&*app.aws, cfg.microvm_id.as_ref(), &app.region).await;
+            // completed event; no runner -> no watchdog): report the orphan
+            // (falling back to self-terminate), never idle.
+            report::report_idle_or_terminate(&*app.aws, &cfg, &app.region, IdleReason::Orphan)
+                .await;
         }
     }
 }
@@ -73,11 +75,24 @@ async fn flow(app: &Arc<AppState>, cfg: &RunConfig) -> Result<(), LaunchError> {
     match ExitPolicy::decide(cfg.pool, ephemeral, exit.watchdog_fired) {
         ExitPolicy::PoolWait => {
             pool::pool_cleanup(app).await;
+            // Report idle FIRST (cleanup is done, so no dispatcher-side
+            // delay applies): the suspend then arrives in seconds instead of
+            // riding the completed webhook, which stays as the backup. The
+            // idle wait below — mailbox polling, stand-down guard, final
+            // claim — is unchanged; a failed report just means the webhook
+            // path (or grace expiry) handles us as before.
+            report::report_idle(&*app.aws, cfg, IdleReason::JobComplete).await;
             pool::pool_idle_wait(app.clone(), cfg).await;
         }
-        // Stop billing now; don't idle to max-duration.
+        // Stop billing now; don't idle to max-duration. A watchdog-killed
+        // runner never ran a job: it reports as an orphan.
         ExitPolicy::SelfTerminate => {
-            terminate::self_terminate(&*app.aws, cfg.microvm_id.as_ref(), &app.region).await;
+            let reason = if exit.watchdog_fired {
+                IdleReason::Orphan
+            } else {
+                IdleReason::JobComplete
+            };
+            report::report_idle_or_terminate(&*app.aws, cfg, &app.region, reason).await;
         }
         ExitPolicy::PersistentIdle => {}
     }

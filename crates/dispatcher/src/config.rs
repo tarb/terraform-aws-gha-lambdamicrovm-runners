@@ -43,6 +43,10 @@ pub struct Config {
     pub suspend_delay: i64,
     pub sweep_min_age: i64,
     pub pool_suspend_grace: i64,
+    /// This Lambda's own function name (the standard
+    /// `AWS_LAMBDA_FUNCTION_NAME` runtime env), handed to pooled VMs so they
+    /// can report idleness back by direct invoke. Empty == unset.
+    pub dispatcher_fn: Option<String>,
 }
 
 impl Config {
@@ -107,6 +111,7 @@ impl Config {
             suspend_delay: int("SUSPEND_DELAY_SECONDS", 20)?,
             sweep_min_age: int("SWEEP_MIN_AGE_SECONDS", 360)?,
             pool_suspend_grace: int("POOL_SUSPEND_GRACE_SECONDS", 300)?,
+            dispatcher_fn: get("AWS_LAMBDA_FUNCTION_NAME").filter(|s| !s.is_empty()),
         })
     }
 
@@ -165,6 +170,7 @@ mod tests {
         assert_eq!(c.log_group, "/aws/lambda-microvms/github-actions-runner");
         assert!(c.image_version.is_none());
         assert!(c.app_secret_arn.is_none());
+        assert!(c.dispatcher_fn.is_none());
         assert_eq!(
             c.required_labels.iter().cloned().collect::<Vec<_>>(),
             vec!["microvm", "self-hosted"]
@@ -226,6 +232,21 @@ mod tests {
                 .app_secret_arn
                 .as_deref(),
             Some("arn:y")
+        );
+    }
+
+    #[test]
+    fn dispatcher_fn_reads_the_lambda_runtime_env_and_empty_is_unset() {
+        assert_eq!(
+            cfg_with(&[("AWS_LAMBDA_FUNCTION_NAME", "gha-microvm-dispatcher")])
+                .dispatcher_fn
+                .as_deref(),
+            Some("gha-microvm-dispatcher")
+        );
+        assert!(
+            cfg_with(&[("AWS_LAMBDA_FUNCTION_NAME", "")])
+                .dispatcher_fn
+                .is_none()
         );
     }
 

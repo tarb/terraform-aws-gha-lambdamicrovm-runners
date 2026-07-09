@@ -29,7 +29,7 @@ variable "artifacts_bucket_name" {
 variable "artifact_version" {
   description = "GitHub release of this module whose prebuilt artifacts (dispatcher.zip, webhook-proxy.zip, entrypoint) are deployed; releases are built by .github/workflows/release.yml."
   type        = string
-  default     = "v0.0.2"
+  default     = "v0.0.3"
 }
 
 ###############################################################################

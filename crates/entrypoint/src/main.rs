@@ -26,6 +26,7 @@ mod logfmt;
 mod payload;
 mod pool;
 mod registration;
+mod report;
 mod rlimit;
 mod server;
 mod state;

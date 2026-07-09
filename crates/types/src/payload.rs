@@ -53,6 +53,12 @@ pub struct RunPayload {
     /// Optional runner group name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_group: Option<String>,
+    /// The dispatcher Lambda's own function name, so the VM can report its
+    /// idleness back by direct invoke (in-guest `TerminateMicrovm` fails in
+    /// PrivateLink-routed VPCs; plain `Invoke` does not). Absent from
+    /// payloads built by older dispatchers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatcher_fn: Option<String>,
     /// Forward-compatibility: fields this version doesn't know survive a
     /// round-trip (a newer dispatcher can hand off to an older entrypoint).
     #[serde(flatten)]
@@ -77,6 +83,7 @@ impl RunPayload {
             handoff_prefix: None,
             microvm_id: None,
             runner_group: None,
+            dispatcher_fn: None,
             extra: BTreeMap::new(),
         }
     }
@@ -121,6 +128,7 @@ impl fmt::Debug for RunPayload {
             .field("handoff_prefix", &self.handoff_prefix)
             .field("microvm_id", &self.microvm_id)
             .field("runner_group", &self.runner_group)
+            .field("dispatcher_fn", &self.dispatcher_fn)
             .field("extra", &self.extra)
             .finish()
     }
@@ -181,6 +189,30 @@ mod tests {
         assert_eq!(v["pool_grace"], 300);
         assert_eq!(v["handoff_prefix"], "/p/handoff");
         assert_eq!(v["microvmId"], "microvm-abc");
+    }
+
+    #[test]
+    fn dispatcher_fn_roundtrips() {
+        let wire = serde_json::json!({
+            "github_url": "https://github.com/o/r",
+            "token": "t",
+            "dispatcher_fn": "gha-microvm-dispatcher",
+        });
+        let p: RunPayload = serde_json::from_value(wire).unwrap();
+        assert_eq!(p.dispatcher_fn.as_deref(), Some("gha-microvm-dispatcher"));
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back["dispatcher_fn"], "gha-microvm-dispatcher");
+    }
+
+    #[test]
+    fn absent_dispatcher_fn_stays_absent_both_directions() {
+        // Backward compatibility: an old dispatcher's payload (no field)
+        // parses to None, and None never serializes the key.
+        let p: RunPayload =
+            serde_json::from_value(serde_json::json!({"github_url": "u", "token": "t"})).unwrap();
+        assert!(p.dispatcher_fn.is_none());
+        let back = serde_json::to_value(&p).unwrap();
+        assert!(!back.as_object().unwrap().contains_key("dispatcher_fn"));
     }
 
     #[test]

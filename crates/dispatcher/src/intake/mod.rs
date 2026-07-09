@@ -1,10 +1,11 @@
-//! Intake classification: the four shapes a Lambda event can take, decided
+//! Intake classification: the five shapes a Lambda event can take, decided
 //! once, deserialized once. Everything below this boundary is typed.
 
 pub mod fnurl_req;
 pub mod webhook;
 
 use serde_json::Value;
+use types::{IdleEvent, IdleReport};
 
 use fnurl_req::FnUrlRequest;
 use webhook::WebhookPayload;
@@ -21,6 +22,8 @@ pub enum IntakeError {
     Base64(String),
     #[error("webhook body is malformed: {0}")]
     BadBody(String),
+    #[error("idle report is malformed: {0}")]
+    BadIdle(String),
 }
 
 pub enum Intake {
@@ -32,6 +35,9 @@ pub enum Intake {
     /// Scheduled reconciliation marker: `sweep` present and truthy
     /// (Python-truthy — installed schedules send `true`/`1`; stay tolerant).
     Sweep,
+    /// A VM's direct-invoke idle report:
+    /// `{"idle": {"microvmId": "...", "reason": "..."}}`.
+    Idle(IdleReport),
     /// Everything else: the legacy Function-URL webhook.
     FunctionUrl(FnUrlRequest),
 }
@@ -68,7 +74,8 @@ impl Envelope {
 }
 
 impl Intake {
-    /// Classification precedence: SQS > EventBridge > Sweep > FunctionUrl.
+    /// Classification precedence: SQS > EventBridge > Sweep > Idle >
+    /// FunctionUrl.
     pub fn classify(event: Value) -> Result<Intake, IntakeError> {
         if let Some(records) = event.get("Records").and_then(Value::as_array)
             && !records.is_empty()
@@ -92,6 +99,11 @@ impl Intake {
         }
         if is_truthy(event.get("sweep").unwrap_or(&Value::Null)) {
             return Ok(Intake::Sweep);
+        }
+        if is_truthy(event.get("idle").unwrap_or(&Value::Null)) {
+            let idle: IdleEvent =
+                serde_json::from_value(event).map_err(|e| IntakeError::BadIdle(e.to_string()))?;
+            return Ok(Intake::Idle(idle.idle));
         }
         Ok(Intake::FunctionUrl(FnUrlRequest::parse(&event)?))
     }
@@ -216,6 +228,59 @@ mod tests {
             classify(json!({"sweep": ""})),
             Intake::FunctionUrl(_)
         ));
+    }
+
+    #[test]
+    fn routes_idle_reports() {
+        let ev = json!({"idle": {"microvmId": "microvm-abc", "reason": "job-complete"}});
+        let Intake::Idle(report) = classify(ev) else {
+            panic!("expected Idle");
+        };
+        assert_eq!(report.microvm_id, "microvm-abc");
+        assert_eq!(report.reason, types::IdleReason::JobComplete);
+
+        let ev = json!({"idle": {"microvmId": "microvm-abc", "reason": "orphan"}});
+        let Intake::Idle(report) = classify(ev) else {
+            panic!("expected Idle");
+        };
+        assert_eq!(report.reason, types::IdleReason::Orphan);
+    }
+
+    #[test]
+    fn malformed_idle_report_is_an_intake_error() {
+        for ev in [
+            json!({"idle": {"reason": "job-complete"}}), // no microvmId
+            json!({"idle": {"microvmId": "m", "reason": "later"}}), // unknown reason
+            json!({"idle": true}),                       // truthy but not a report
+        ] {
+            assert!(matches!(Intake::classify(ev), Err(IntakeError::BadIdle(_))));
+        }
+    }
+
+    #[test]
+    fn falsy_idle_marker_falls_through_to_function_url() {
+        assert!(matches!(
+            classify(json!({"idle": null})),
+            Intake::FunctionUrl(_)
+        ));
+        assert!(matches!(
+            classify(json!({"idle": {}})),
+            Intake::FunctionUrl(_)
+        ));
+        assert!(matches!(
+            classify(json!({"idle": false})),
+            Intake::FunctionUrl(_)
+        ));
+    }
+
+    #[test]
+    fn sweep_outranks_idle() {
+        // Precedence: sweep marker > idle report.
+        let ev = json!({
+            "sweep": true,
+            "idle": {"microvmId": "microvm-abc", "reason": "orphan"},
+        });
+        assert!(matches!(classify(ev), Intake::Sweep));
     }
 
     #[test]

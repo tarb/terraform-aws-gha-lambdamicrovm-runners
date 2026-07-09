@@ -65,8 +65,10 @@ resource "aws_iam_role_policy" "build" {
 }
 
 ###############################################################################
-# Exec role - assumed AT RUNTIME by each MicroVM. Writes runner/dockerd logs and
-# may self-terminate when an ephemeral job ends (stops billing immediately).
+# Exec role - assumed AT RUNTIME by each MicroVM. Writes runner/dockerd logs,
+# reports idleness to the dispatcher (which suspends/terminates it from the
+# control plane), and may self-terminate as the fallback (stops billing
+# immediately).
 ###############################################################################
 
 resource "aws_iam_role" "exec" {
@@ -88,6 +90,18 @@ data "aws_iam_policy_document" "exec" {
     effect    = "Allow"
     actions   = ["lambda:TerminateMicrovm"]
     resources = ["*"]
+  }
+  # Idle reports: the VM invokes the dispatcher, which suspends or terminates
+  # it from the control plane. A plain Lambda Invoke works over a PrivateLink
+  # interface endpoint, where the MicroVMs sub-API (TerminateMicrovm above)
+  # rejects PrivateLink outright - self-terminate stays as the fallback.
+  # (No resource cycle: the dispatcher function depends on the exec ROLE, and
+  # this document feeds the exec role POLICY, a separate resource.)
+  statement {
+    sid       = "ReportIdleToDispatcher"
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [aws_lambda_function.dispatcher.arn]
   }
   # Pull-handoff mailbox: a resumed VM fetches + deletes its own parked run
   # payload. Path-wide (the VM id is dynamic); tokens inside are short-lived,

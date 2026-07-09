@@ -133,6 +133,9 @@ pub struct FakeMicrovmApi {
     active_session: AtomicUsize,
     pub list_calls: AtomicUsize,
     pub list_error: Mutex<Option<AwsApiError>>,
+    /// Errors returned by the next list calls, one per call, before
+    /// `listings` is consulted (throttle-retry tests).
+    pub list_error_queue: Mutex<Vec<AwsApiError>>,
     pub state: Mutex<Option<Result<MicrovmState, AwsApiError>>>,
     pub image_latest: Mutex<Option<String>>,
     pub run_result: Mutex<Option<Result<MicrovmId, AwsApiError>>>,
@@ -149,6 +152,7 @@ impl FakeMicrovmApi {
             active_session: AtomicUsize::new(0),
             list_calls: AtomicUsize::new(0),
             list_error: Mutex::new(None),
+            list_error_queue: Mutex::new(Vec::new()),
             state: Mutex::new(None),
             image_latest: Mutex::new(Some("9".to_string())),
             run_result: Mutex::new(None),
@@ -179,6 +183,12 @@ impl FakeMicrovmApi {
                 }]
             })
             .collect();
+    }
+
+    /// Fail the next `n` list calls with `err`, then serve `listings`
+    /// normally (throttle-retry tests).
+    pub fn fail_next_lists(&self, n: usize, err: AwsApiError) {
+        *self.list_error_queue.lock().unwrap() = vec![err; n];
     }
 
     /// Script one traversal as multiple pages (pagination tests).
@@ -219,6 +229,12 @@ impl MicrovmApi for FakeMicrovmApi {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(e) = self.list_error.lock().unwrap().clone() {
             return Err(e);
+        }
+        {
+            let mut queue = self.list_error_queue.lock().unwrap();
+            if !queue.is_empty() {
+                return Err(queue.remove(0));
+            }
         }
         let listings = self.listings.lock().unwrap();
         if listings.is_empty() {
@@ -374,6 +390,8 @@ pub struct FakeGithub {
     pub runners: Mutex<HashMap<String, Result<Vec<RunnerInfo>, GithubError>>>,
     pub queued_runs: Mutex<Vec<WorkflowRun>>,
     pub in_progress_runs: Mutex<Vec<WorkflowRun>>,
+    /// Per-repo `workflow_runs` failures (sweep scan-failure tests).
+    pub runs_errors: Mutex<HashMap<String, GithubError>>,
     /// Per-run-id job listings.
     pub jobs: Mutex<HashMap<i64, Vec<JobInfo>>>,
 }
@@ -387,6 +405,7 @@ impl FakeGithub {
             runners: Mutex::new(HashMap::new()),
             queued_runs: Mutex::new(Vec::new()),
             in_progress_runs: Mutex::new(Vec::new()),
+            runs_errors: Mutex::new(HashMap::new()),
             jobs: Mutex::new(HashMap::new()),
         }
     }
@@ -396,6 +415,15 @@ impl FakeGithub {
             .lock()
             .unwrap()
             .insert(repo.to_string(), Ok(runners));
+    }
+
+    /// Make `workflow_runs` fail for `repo` (e.g. a 403 from a missing App
+    /// permission).
+    pub fn fail_runs(&self, repo: &str, err: GithubError) {
+        self.runs_errors
+            .lock()
+            .unwrap()
+            .insert(repo.to_string(), err);
     }
 }
 
@@ -436,10 +464,13 @@ impl GithubApi for FakeGithub {
 
     async fn workflow_runs(
         &self,
-        _repo: &str,
+        repo: &str,
         _token: &InstallationToken,
         status: RunStatus,
     ) -> Result<Vec<WorkflowRun>, GithubError> {
+        if let Some(e) = self.runs_errors.lock().unwrap().get(repo) {
+            return Err(e.clone());
+        }
         Ok(match status {
             RunStatus::Queued => self.queued_runs.lock().unwrap().clone(),
             RunStatus::InProgress => self.in_progress_runs.lock().unwrap().clone(),

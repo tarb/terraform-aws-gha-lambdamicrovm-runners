@@ -3,14 +3,16 @@
 //! terminate — never a stuck job.
 
 use serde_json::{Value, json};
-use types::{MicrovmId, RunPayload, RunnerName};
+use types::{IdleReason, IdleReport, MicrovmId, RunPayload, RunnerName};
 
 use crate::aws::params::ParamMeta;
 use crate::clock::Epoch;
 use crate::dispatch::{DispatchError, JobRef};
+use crate::github::GithubError;
 use crate::github::types::{InstallationId, JobInfo, RepoRef, RunnerInfo, WorkflowRun};
 use crate::handler;
 use crate::intake::webhook::WebhookPayload;
+use crate::oplog;
 use crate::pool::{IntakeOutcome, ResumeOutcome};
 use crate::sweep::Deadline;
 use crate::testsupport::*;
@@ -85,7 +87,8 @@ async fn running_count_counts_only_pending_and_running() {
             .map(|s| vm_record(&format!("microvm-{}", s.to_lowercase()), s, "9", None))
             .collect(),
     );
-    assert_eq!(f.fleet.running_count().await.unwrap(), 2);
+    let vms = f.fleet.list().await.unwrap();
+    assert_eq!(crate::fleet::Fleet::count_running(&vms), 2);
 }
 
 // ── concurrency cap ──────────────────────────────────────────────────────
@@ -251,7 +254,349 @@ async fn completed_recheck_after_delay_catches_racing_completions() {
     );
 }
 
+// ── idle intake (direct-invoke idle reports) ─────────────────────────────
+
+fn idle(reason: IdleReason) -> IdleReport {
+    IdleReport {
+        microvm_id: DEFAULT_VM_ID.to_string(),
+        reason,
+        repo: None,
+    }
+}
+
+#[tokio::test]
+async fn idle_job_complete_suspends_without_delay() {
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    let out = svc.pool.intake_idle(&idle(IdleReason::JobComplete)).await;
+    assert_eq!(out, IntakeOutcome::Suspended);
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Suspend(_))),
+        1
+    );
+    // The VM reported AFTER its own cleanup: no SUSPEND_DELAY sleep (the
+    // config default of 20 s would show up in the fake clock's record).
+    assert!(
+        f.clock.sleeps.lock().unwrap().is_empty(),
+        "idle intake must not sleep"
+    );
+}
+
+#[tokio::test]
+async fn idle_orphan_terminates_even_with_pool_room() {
+    // reason=orphan ALWAYS terminates, pool slot free or not: an orphan's
+    // guest returns right after reporting (it never re-enters the idle
+    // wait), so a suspended orphan could never claim a handoff — a dead
+    // pool slot. Adoption needs a guest wait-after-report handshake first.
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    let out = svc.pool.intake_idle(&idle(IdleReason::Orphan)).await;
+    assert_eq!(out, IntakeOutcome::OrphanTerminated);
+    assert_eq!(f.journal.terminated(), vec![MicrovmId::new(DEFAULT_VM_ID)]);
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Suspend(_))),
+        0,
+        "an orphan must never be suspended into the pool"
+    );
+    // The terminate rides the normal keys: pool + microvmId.
+    assert!(
+        oplog::capture::lines()
+            .iter()
+            .any(|l| l["pool"] == "terminate-orphan" && l["microvmId"] == DEFAULT_VM_ID)
+    );
+}
+
+#[tokio::test]
+async fn idle_busy_orphan_is_still_skipped_not_terminated() {
+    // The busy guard outranks the orphan terminate: a late orphan report
+    // for a VM that took a new job must not kill the job.
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    *f.github.installations.lock().unwrap() = Ok(vec![InstallationId(1)]);
+    *f.github.repos.lock().unwrap() = Ok(vec![RepoRef {
+        full_name: "o/r".to_string(),
+    }]);
+    f.github.set_runners(
+        "o/r",
+        vec![RunnerInfo {
+            name: RunnerName::for_vm(&MicrovmId::new(DEFAULT_VM_ID))
+                .as_str()
+                .to_string(),
+            busy: true,
+        }],
+    );
+    let out = svc.pool.intake_idle(&idle(IdleReason::Orphan)).await;
+    assert_eq!(out, IntakeOutcome::RunnerBusy);
+    assert!(f.journal.terminated().is_empty());
+}
+
+#[tokio::test]
+async fn idle_pool_full_terminates() {
+    let (svc, f) = harness_with(|c| {
+        c.pool_enabled = true;
+        c.pool_max_size = 1;
+    });
+    f.mv.set_vms(vec![
+        vm("RUNNING"),
+        vm_record("microvm-other", "SUSPENDED", "9", None),
+    ]);
+    let out = svc.pool.intake_idle(&idle(IdleReason::JobComplete)).await;
+    assert_eq!(out, IntakeOutcome::PoolFull);
+    assert_eq!(f.journal.terminated(), vec![MicrovmId::new(DEFAULT_VM_ID)]);
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Suspend(_))),
+        0
+    );
+}
+
+#[tokio::test]
+async fn idle_with_pool_disabled_terminates() {
+    // A disabled pool has room for nothing, but the VM still asked to be
+    // dealt with — terminate rather than leak a suspended VM nothing GCs.
+    let (svc, f) = harness(); // pool disabled
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    let out = svc.pool.intake_idle(&idle(IdleReason::JobComplete)).await;
+    assert_eq!(out, IntakeOutcome::PoolFull);
+    assert_eq!(f.journal.terminated(), vec![MicrovmId::new(DEFAULT_VM_ID)]);
+}
+
+#[tokio::test]
+async fn idle_stale_image_vm_terminates() {
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    // Current image version is "9"; this VM runs "8".
+    f.mv.set_vms(vec![vm_record(DEFAULT_VM_ID, "RUNNING", "8", None)]);
+    let out = svc.pool.intake_idle(&idle(IdleReason::JobComplete)).await;
+    assert_eq!(out, IntakeOutcome::StaleImage);
+    assert_eq!(f.journal.terminated(), vec![MicrovmId::new(DEFAULT_VM_ID)]);
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Suspend(_))),
+        0
+    );
+}
+
+#[tokio::test]
+async fn idle_busy_runner_is_skipped() {
+    // A late/duplicate report must not freeze (or kill) a VM that took a
+    // new job: its derived runner name shows busy on GitHub.
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    *f.github.installations.lock().unwrap() = Ok(vec![InstallationId(1)]);
+    *f.github.repos.lock().unwrap() = Ok(vec![RepoRef {
+        full_name: "o/r".to_string(),
+    }]);
+    f.github.set_runners(
+        "o/r",
+        vec![RunnerInfo {
+            name: RunnerName::for_vm(&MicrovmId::new(DEFAULT_VM_ID))
+                .as_str()
+                .to_string(),
+            busy: true,
+        }],
+    );
+    let out = svc.pool.intake_idle(&idle(IdleReason::JobComplete)).await;
+    assert_eq!(out, IntakeOutcome::RunnerBusy);
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Suspend(_))),
+        0
+    );
+    assert!(f.journal.terminated().is_empty());
+}
+
+#[tokio::test]
+async fn idle_report_with_repo_hint_uses_the_scoped_busy_check() {
+    // The report names its repo: the busy-check asks THAT repo's runner
+    // listing (like the completed path) instead of walking installations.
+    // Installations are deliberately unscripted here — the fleet-wide
+    // fallback would see no runners and report not-busy, so only the scoped
+    // check can produce RunnerBusy.
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    f.github.set_runners(
+        "o/r",
+        vec![RunnerInfo {
+            name: RunnerName::for_vm(&MicrovmId::new(DEFAULT_VM_ID))
+                .as_str()
+                .to_string(),
+            busy: true,
+        }],
+    );
+    let mut report = idle(IdleReason::JobComplete);
+    report.repo = Some("o/r".to_string());
+    let out = svc.pool.intake_idle(&report).await;
+    assert_eq!(out, IntakeOutcome::RunnerBusy);
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Suspend(_))),
+        0
+    );
+    assert!(f.journal.terminated().is_empty());
+}
+
+#[tokio::test]
+async fn idle_report_without_repo_hint_falls_back_to_the_fleet_scan() {
+    // Same busy runner, but only findable through the installations walk:
+    // a hint-less report must still find it there.
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    *f.github.installations.lock().unwrap() = Ok(vec![InstallationId(1)]);
+    *f.github.repos.lock().unwrap() = Ok(vec![RepoRef {
+        full_name: "o/r".to_string(),
+    }]);
+    f.github.set_runners(
+        "o/r",
+        vec![RunnerInfo {
+            name: RunnerName::for_vm(&MicrovmId::new(DEFAULT_VM_ID))
+                .as_str()
+                .to_string(),
+            busy: true,
+        }],
+    );
+    let out = svc.pool.intake_idle(&idle(IdleReason::JobComplete)).await;
+    assert_eq!(out, IntakeOutcome::RunnerBusy);
+}
+
+#[tokio::test]
+async fn idle_report_for_a_recently_resumed_vm_is_skipped() {
+    // This container resumed the VM moments ago: the report is the
+    // pre-suspend guest's, thawed late — the resume's run owns the VM.
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    f.ledger.mark(&MicrovmId::new(DEFAULT_VM_ID));
+    let out = svc.pool.intake_idle(&idle(IdleReason::JobComplete)).await;
+    assert_eq!(out, IntakeOutcome::RecentlyResumed);
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Suspend(_))),
+        0
+    );
+    assert!(f.journal.terminated().is_empty());
+    assert_eq!(
+        f.mv.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the guard sits BEFORE any fleet call"
+    );
+    assert!(
+        oplog::capture::lines()
+            .iter()
+            .any(|l| l["pool"] == "idle-skip"
+                && l["microvmId"] == DEFAULT_VM_ID
+                && l["why"] == "recently-resumed")
+    );
+}
+
+#[tokio::test]
+async fn idle_suspend_recheck_catches_racing_intakes() {
+    // TOCTOU on the idle cap: the guard passes on the first listing, but a
+    // racing intake fills the pool during the busy/stale checks. The
+    // re-list immediately before the freeze must catch it and terminate
+    // with the existing full-terminating key.
+    let (svc, f) = harness_with(|c| {
+        c.pool_enabled = true;
+        c.pool_max_size = 1;
+    });
+    f.mv.set_successive_listings(vec![
+        // Intake view: our VM finished, pool empty - guard passes.
+        vec![vm("RUNNING")],
+        // Pre-suspend re-list: a racing report suspended another VM first.
+        vec![
+            vm("RUNNING"),
+            vm_record("microvm-other", "SUSPENDED", "9", None),
+        ],
+    ]);
+    let out = svc.pool.intake_idle(&idle(IdleReason::JobComplete)).await;
+    assert_eq!(out, IntakeOutcome::PoolFull);
+    assert_eq!(
+        f.journal.terminated(),
+        vec![MicrovmId::new(DEFAULT_VM_ID)],
+        "over-cap VM is terminated, not suspended"
+    );
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Suspend(_))),
+        0
+    );
+    assert!(
+        oplog::capture::lines()
+            .iter()
+            .any(|l| l["pool"] == "full-terminating" && l["microvmId"] == DEFAULT_VM_ID)
+    );
+}
+
+#[tokio::test]
+async fn idle_unknown_or_not_running_vm_is_skipped_with_a_log() {
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    // Unknown VM.
+    f.mv.set_vms(vec![]);
+    let out = svc.pool.intake_idle(&idle(IdleReason::Orphan)).await;
+    assert!(matches!(out, IntakeOutcome::AlreadyGone { .. }), "{out:?}");
+    // Already suspended.
+    f.mv.set_vms(vec![vm("SUSPENDED")]);
+    let out = svc.pool.intake_idle(&idle(IdleReason::Orphan)).await;
+    assert_eq!(out, IntakeOutcome::AlreadySuspended);
+    // Pending (not RUNNING).
+    f.mv.set_vms(vec![vm("PENDING")]);
+    let out = svc.pool.intake_idle(&idle(IdleReason::Orphan)).await;
+    assert!(matches!(out, IntakeOutcome::NotRunning { .. }), "{out:?}");
+    // Nothing was touched, and every skip logged.
+    assert!(f.journal.terminated().is_empty());
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Suspend(_))),
+        0
+    );
+    let skips: Vec<Value> = oplog::capture::lines()
+        .into_iter()
+        .filter(|l| l["pool"] == "idle-skip")
+        .collect();
+    assert_eq!(skips.len(), 3, "{skips:?}");
+}
+
+#[tokio::test]
+async fn idle_intake_never_raises() {
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    *f.mv.list_error.lock().unwrap() = Some(client_error("InternalServerError"));
+    let out = svc.pool.intake_idle(&idle(IdleReason::JobComplete)).await;
+    assert_eq!(out, IntakeOutcome::BenignError);
+}
+
+#[tokio::test]
+async fn idle_report_logs_receipt_and_outcome_keys() {
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    svc.pool.intake_idle(&idle(IdleReason::JobComplete)).await;
+    let lines = oplog::capture::lines();
+    let receipt = lines
+        .iter()
+        .find(|l| l["pool"] == "idle-report")
+        .expect("receipt line");
+    assert_eq!(receipt["microvmId"], DEFAULT_VM_ID);
+    assert_eq!(receipt["reason"], "job-complete");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l["pool"] == "suspended" && l["microvmId"] == DEFAULT_VM_ID),
+        "existing outcome key expected: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn handler_routes_direct_invoke_idle_events() {
+    let (svc, f) = harness_with(|c| c.pool_enabled = true);
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    let event = json!({"idle": {"microvmId": DEFAULT_VM_ID, "reason": "job-complete"}});
+    let out = handler::handle(&svc, event, Deadline::none())
+        .await
+        .unwrap();
+    assert_eq!(out, json!({"ok": "suspended"}));
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Suspend(_))),
+        1
+    );
+}
+
 // ── pool resume (pull handoff) ───────────────────────────────────────────
+
+/// Direct `try_resume` tests hand it a fresh listing, exactly as dispatch
+/// does with its one shared `ListMicrovms` result.
+async fn listed(f: &Fakes) -> Vec<crate::fleet::VmRecord> {
+    f.fleet.list().await.unwrap()
+}
 
 fn handoff_param() -> String {
     format!("/gha-microvm/handoff/{DEFAULT_VM_ID}")
@@ -270,7 +615,11 @@ fn arm_claimed_handoff(f: &Fakes) {
 async fn resume_no_candidates_cold_launches() {
     let (svc, f) = harness_with(|c| c.pool_enabled = true);
     f.mv.set_vms(vec![vm("RUNNING")]);
-    let out = svc.pool.try_resume(&run_payload()).await.unwrap();
+    let out = svc
+        .pool
+        .try_resume(&run_payload(), &listed(&f).await)
+        .await
+        .unwrap();
     assert!(matches!(out, ResumeOutcome::NoCandidate));
     assert_eq!(f.journal.count(|e| matches!(e, JournalEvent::Resume(_))), 0);
 }
@@ -281,7 +630,11 @@ async fn resume_parks_before_resuming_and_treats_delete_as_ack() {
     f.mv.set_vms(vec![vm("SUSPENDED")]);
     *f.mv.state.lock().unwrap() = Some(Ok(crate::fleet::MicrovmState::Suspended));
     arm_claimed_handoff(&f);
-    let out = svc.pool.try_resume(&run_payload()).await.unwrap();
+    let out = svc
+        .pool
+        .try_resume(&run_payload(), &listed(&f).await)
+        .await
+        .unwrap();
     assert!(matches!(out, ResumeOutcome::Resumed), "{out:?}");
     let order: Vec<JournalEvent> = f
         .journal
@@ -313,7 +666,11 @@ async fn resume_unclaimed_terminates_and_cleans_up() {
     });
     f.mv.set_vms(vec![vm("SUSPENDED")]);
     *f.mv.state.lock().unwrap() = Some(Ok(crate::fleet::MicrovmState::Suspended));
-    let out = svc.pool.try_resume(&run_payload()).await.unwrap();
+    let out = svc
+        .pool
+        .try_resume(&run_payload(), &listed(&f).await)
+        .await
+        .unwrap();
     assert!(matches!(out, ResumeOutcome::Abandoned), "{out:?}");
     assert_eq!(f.journal.count(|e| matches!(e, JournalEvent::Delete(_))), 1);
     assert_eq!(f.journal.terminated(), vec![MicrovmId::new(DEFAULT_VM_ID)]);
@@ -323,7 +680,11 @@ async fn resume_unclaimed_terminates_and_cleans_up() {
 async fn resume_stale_image_candidate_terminated_not_resumed() {
     let (svc, f) = harness_with(|c| c.pool_enabled = true);
     f.mv.set_vms(vec![vm_record(DEFAULT_VM_ID, "SUSPENDED", "8", None)]);
-    let out = svc.pool.try_resume(&run_payload()).await.unwrap();
+    let out = svc
+        .pool
+        .try_resume(&run_payload(), &listed(&f).await)
+        .await
+        .unwrap();
     assert!(matches!(out, ResumeOutcome::NoCandidate));
     assert_eq!(f.journal.terminated(), vec![MicrovmId::new(DEFAULT_VM_ID)]);
     assert_eq!(f.journal.count(|e| matches!(e, JournalEvent::Resume(_))), 0);
@@ -335,7 +696,11 @@ async fn resume_race_lost_moves_on_without_terminating() {
     f.mv.set_vms(vec![vm("SUSPENDED")]);
     // Another dispatcher owns it now.
     *f.mv.state.lock().unwrap() = Some(Ok(crate::fleet::MicrovmState::Running));
-    let out = svc.pool.try_resume(&run_payload()).await.unwrap();
+    let out = svc
+        .pool
+        .try_resume(&run_payload(), &listed(&f).await)
+        .await
+        .unwrap();
     assert!(matches!(out, ResumeOutcome::NoCandidate));
     assert!(
         f.journal.terminated().is_empty(),
@@ -349,7 +714,10 @@ async fn resumed_vm_is_tracked_for_the_zombie_reaper() {
     f.mv.set_vms(vec![vm("SUSPENDED")]);
     *f.mv.state.lock().unwrap() = Some(Ok(crate::fleet::MicrovmState::Suspended));
     arm_claimed_handoff(&f);
-    svc.pool.try_resume(&run_payload()).await.unwrap();
+    svc.pool
+        .try_resume(&run_payload(), &listed(&f).await)
+        .await
+        .unwrap();
     assert!(f.ledger.recently(
         &MicrovmId::new(DEFAULT_VM_ID),
         std::time::Duration::from_secs(600)
@@ -453,6 +821,60 @@ async fn pooled_cold_launch_payload_adds_the_pool_fields() {
 }
 
 #[tokio::test]
+async fn pooled_payload_carries_the_dispatcher_fn() {
+    // Both delivery paths — the cold-launch runHookPayload and the parked
+    // mailbox copy — are built from the same payload, so both carry the
+    // dispatcher's own function name for the VM's idle report.
+    let (svc, f) = harness_with(|c| {
+        c.pool_enabled = true;
+        c.dispatcher_fn = Some("gha-microvm-dispatcher".to_string());
+    });
+    // A suspended candidate: the payload is parked in its mailbox before the
+    // resume, and the parked copy must carry the field.
+    f.mv.set_vms(vec![vm("SUSPENDED")]);
+    *f.mv.state.lock().unwrap() = Some(Ok(crate::fleet::MicrovmState::Suspended));
+    arm_claimed_handoff(&f);
+    svc.dispatcher
+        .dispatch(&job_ref("org/repo", 7))
+        .await
+        .unwrap();
+    {
+        // Scoped: clippy's await_holding_lock ignores explicit drops.
+        let puts = f.params.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1, "payload parked in the mailbox");
+        let parked: Value = serde_json::from_str(&puts[0].1).unwrap();
+        assert_eq!(parked["dispatcher_fn"], "gha-microvm-dispatcher");
+    }
+
+    // Cold launch (no candidates): same field in the runHookPayload.
+    f.mv.set_vms(vec![]);
+    svc.dispatcher
+        .dispatch(&job_ref("org/repo", 8))
+        .await
+        .unwrap();
+    let specs = f.mv.run_specs.lock().unwrap();
+    let payload: Value = serde_json::from_str(&specs[0].run_hook_payload).unwrap();
+    assert_eq!(payload["dispatcher_fn"], "gha-microvm-dispatcher");
+}
+
+#[tokio::test]
+async fn non_pooled_payload_omits_the_dispatcher_fn() {
+    let (svc, f) = harness_with(|c| {
+        c.dispatcher_fn = Some("gha-microvm-dispatcher".to_string()); // pool disabled
+    });
+    svc.dispatcher
+        .dispatch(&job_ref("org/repo", 7))
+        .await
+        .unwrap();
+    let specs = f.mv.run_specs.lock().unwrap();
+    let payload: Value = serde_json::from_str(&specs[0].run_hook_payload).unwrap();
+    assert!(
+        !payload.as_object().unwrap().contains_key("dispatcher_fn"),
+        "{payload}"
+    );
+}
+
+#[tokio::test]
 async fn run_microvm_retries_transient_access_denied() {
     let (svc, f) = harness();
     *f.mv.run_result.lock().unwrap() = Some(Err(client_error("AccessDeniedException")));
@@ -468,6 +890,119 @@ async fn run_microvm_retries_transient_access_denied() {
     // 4 attempts total, 1.5 s sleeps in between.
     assert_eq!(f.mv.run_specs.lock().unwrap().len(), 4);
     assert_eq!(*f.clock.sleeps.lock().unwrap(), vec![1.5, 1.5, 1.5]);
+}
+
+// ── dispatch: shared listing + throttle retry ────────────────────────────
+
+#[tokio::test]
+async fn dispatch_lists_the_fleet_exactly_once() {
+    // The cap gate and the pool candidate scan share ONE ListMicrovms
+    // result — the doubled listing is what throttled the control plane
+    // under webhook bursts. Candidate freshness rides on the per-candidate
+    // GetMicrovm re-check, which must still happen.
+    let (svc, f) = harness_with(|c| {
+        c.pool_enabled = true;
+        c.max_concurrency = 4;
+    });
+    f.mv.set_vms(vec![vm("SUSPENDED")]);
+    *f.mv.state.lock().unwrap() = Some(Ok(crate::fleet::MicrovmState::Suspended));
+    arm_claimed_handoff(&f);
+    svc.dispatcher
+        .dispatch(&job_ref("org/repo", 21))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.mv.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one ListMicrovms per dispatch, shared by cap gate and pool scan"
+    );
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Resume(_))),
+        1,
+        "the candidate scan still ran (and resumed) off the shared listing"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_retries_throttled_listing_and_succeeds() {
+    // The incident shape: a dispatch stampede throttles ListMicrovms. Two
+    // throttles then a success must end in a dispatched job, not a job
+    // orphaned onto the 5-minute sweep.
+    let (svc, f) = harness_with(|c| c.max_concurrency = 4);
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    f.mv.fail_next_lists(2, client_error("ThrottlingException"));
+    svc.dispatcher
+        .dispatch(&job_ref("org/repo", 22))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.mv.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "two throttled attempts, then the success"
+    );
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Run)),
+        1,
+        "the job launched"
+    );
+    // Two full-jitter gaps under the schedule's ceilings (0.5 s, then 1 s).
+    let sleeps = f.clock.sleeps.lock().unwrap().clone();
+    assert_eq!(sleeps.len(), 2, "{sleeps:?}");
+    assert!(sleeps[0] <= 0.5 && sleeps[1] <= 1.0, "{sleeps:?}");
+    // One burst line, with the throttled-attempt count.
+    assert!(
+        oplog::capture::lines()
+            .iter()
+            .any(|l| l["pool"] == "throttled" && l["calls"] == 2),
+        "{:?}",
+        oplog::capture::lines()
+    );
+}
+
+#[tokio::test]
+async fn dispatch_throttle_retry_is_bounded_and_still_errors_for_the_queue() {
+    // Exhaustion: the envelope is 4 attempts, then the error surfaces so
+    // the SQS message retries — bounded, never a stuck invoke.
+    let (svc, f) = harness_with(|c| c.max_concurrency = 4);
+    f.mv.set_vms(vec![vm("RUNNING")]);
+    f.mv.fail_next_lists(10, client_error("ThrottlingException"));
+    let err = svc
+        .dispatcher
+        .dispatch(&job_ref("org/repo", 23))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DispatchError::Aws(crate::aws::AwsApiError::Service { .. })
+    ));
+    assert_eq!(
+        f.mv.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "bounded at 4 attempts"
+    );
+    assert_eq!(
+        f.journal.count(|e| matches!(e, JournalEvent::Run)),
+        0,
+        "no launch behind an unknown cap"
+    );
+    assert!(
+        oplog::capture::lines()
+            .iter()
+            .any(|l| l["pool"] == "throttled" && l["calls"] == 4)
+    );
+}
+
+#[tokio::test]
+async fn dispatch_without_cap_or_pool_never_lists() {
+    // max_concurrency == 0 and pool disabled: the dispatch path has no use
+    // for a listing and must not spend control-plane TPS on one.
+    let (svc, f) = harness();
+    svc.dispatcher
+        .dispatch(&job_ref("org/repo", 24))
+        .await
+        .unwrap();
+    assert_eq!(f.mv.list_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(f.journal.count(|e| matches!(e, JournalEvent::Run)), 1);
 }
 
 // ── handler routing ──────────────────────────────────────────────────────
@@ -759,6 +1294,84 @@ async fn sweep_registered_runner_is_not_a_zombie() {
     );
     svc.sweeper.sweep(&Deadline::none()).await.unwrap();
     assert!(f.journal.terminated().is_empty());
+}
+
+fn scan_failed_lines() -> Vec<Value> {
+    oplog::capture::lines()
+        .into_iter()
+        .filter(|l| l["sweep"] == "scan-failed-everywhere")
+        .collect()
+}
+
+#[tokio::test]
+async fn sweep_emits_loud_line_when_every_repo_scan_fails() {
+    // The two-day-silent failure mode: a missing App permission 403s every
+    // job scan while "sweep: done, dispatched: 0" looks healthy.
+    let (svc, f) = harness();
+    arm_sweep_github(&f);
+    *f.github.repos.lock().unwrap() = Ok(vec![
+        RepoRef {
+            full_name: "o/r".to_string(),
+        },
+        RepoRef {
+            full_name: "o/r2".to_string(),
+        },
+    ]);
+    let forbidden = GithubError::Status {
+        status: 403,
+        endpoint: "repos/o/r/actions/runs".to_string(),
+    };
+    f.github.fail_runs("o/r", forbidden.clone());
+    f.github.fail_runs("o/r2", forbidden);
+    let dispatched = svc.sweeper.sweep(&Deadline::none()).await.unwrap();
+    assert_eq!(dispatched, 0);
+    let lines = scan_failed_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["repos"], 2);
+    let err = lines[0]["err"].as_str().unwrap();
+    assert!(err.contains("403"), "{err}");
+}
+
+#[tokio::test]
+async fn sweep_stays_quiet_when_any_repo_scan_succeeds() {
+    let (svc, f) = harness();
+    arm_sweep_github(&f);
+    *f.github.repos.lock().unwrap() = Ok(vec![
+        RepoRef {
+            full_name: "o/r".to_string(),
+        },
+        RepoRef {
+            full_name: "o/broken".to_string(),
+        },
+    ]);
+    f.github.fail_runs(
+        "o/broken",
+        GithubError::Status {
+            status: 403,
+            endpoint: "repos/o/broken/actions/runs".to_string(),
+        },
+    );
+    let dispatched = svc.sweeper.sweep(&Deadline::none()).await.unwrap();
+    assert_eq!(dispatched, 1, "the healthy repo still dispatched");
+    assert!(
+        scan_failed_lines().is_empty(),
+        "one success must silence the all-failed line"
+    );
+}
+
+#[tokio::test]
+async fn sweep_installations_failure_emits_loud_line_and_still_raises() {
+    let (svc, f) = harness();
+    *f.github.installations.lock().unwrap() = Err(GithubError::Status {
+        status: 403,
+        endpoint: "app/installations".to_string(),
+    });
+    let err = svc.sweeper.sweep(&Deadline::none()).await.unwrap_err();
+    assert!(matches!(err, GithubError::Status { status: 403, .. }));
+    let lines = scan_failed_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["repos"], 0);
+    assert!(lines[0]["err"].as_str().unwrap().contains("403"));
 }
 
 #[tokio::test]
