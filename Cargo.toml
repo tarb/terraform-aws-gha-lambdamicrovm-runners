@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/types",
+    "crates/dispatcher",
+    "crates/webhook-proxy",
+    "crates/entrypoint",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/tarb/terraform-aws-gha-lambdamicrovm-runners"
+
+[workspace.dependencies]
+types = { path = "crates/types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+thiserror = "2"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
+aws-sdk-lambdamicrovms = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-sdk-ssm = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-sdk-eventbridge = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+lambda_runtime = "1.2"
+aws_lambda_events = { version = "1.2", default-features = false, features = ["sqs", "eventbridge"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
+hmac = "0.13"
+sha2 = "0.11"
+hex = "0.4"
+# ── idiomatic-rewrite additions (see scratchpad IDIOMATIC-DESIGN.md §6) ──────
+# Hook server (entrypoint). Pure-Rust hyper stack: musl-static friendly, no TLS needed in-guest.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+# Router::oneshot in entrypoint server tests (dev-dependency there).
+tower = { version = "0.5", default-features = false, features = ["util"] }
+http-body-util = "0.1"
+# dyn-compatible async seams (CloudControl, MicrovmApi, GithubApi, ...).
+async-trait = "0.1"
+# In-memory secret hygiene: tokens, App PEM, webhook secret.
+secrecy = { version = "0.10", features = ["serde"] }
+# Replaces raw `libc` in the entrypoint (SIGTERM, RLIMIT_NOFILE). musl-clean.
+nix = { version = "0.31", default-features = false, features = ["signal", "resource"] }
+# GitHub %Y-%m-%dT%H:%M:%SZ parsing (dispatcher gtime); std-only, no tzdb baggage.
+jiff = { version = "0.2", default-features = false, features = ["std"] }
+# Promoted from per-crate deps (dispatcher + webhook-proxy Function-URL bodies).
+base64 = "0.22"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

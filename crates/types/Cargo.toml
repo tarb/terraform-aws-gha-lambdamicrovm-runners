@@ -1,0 +1,15 @@
+[package]
+name = "types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# X-Hub-Signature-256 verification (types::sig) — shared by the dispatcher
+# and the webhook proxy so the check can never drift between them.
+secrecy = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

@@ -1,0 +1,33 @@
+[package]
+name = "dispatcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+serde = { workspace = true }
+# preserve_order keeps intake payloads and log lines in their original key
+# order — harmless, and the logs read naturally
+serde_json = { workspace = true, features = ["preserve_order"] }
+base64 = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+secrecy = { workspace = true }
+jiff = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-lambdamicrovms = { workspace = true }
+aws-sdk-ssm = { workspace = true }
+aws-sdk-secretsmanager = { workspace = true }
+lambda_runtime = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+# test-only `sign` helper; verification itself lives in types::sig
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

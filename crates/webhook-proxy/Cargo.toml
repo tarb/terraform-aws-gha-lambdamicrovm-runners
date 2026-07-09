@@ -1,0 +1,31 @@
+[package]
+name = "webhook-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Shared Function-URL response shape (types::fnurl) and webhook signature
+# verification (types::sig)
+types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-ssm = { workspace = true }
+aws-sdk-eventbridge = { workspace = true }
+lambda_runtime = { workspace = true }
+# dyn EventBus / SecretSource seams
+async-trait = { workspace = true }
+# webhook secret hygiene in memory
+secrecy = { workspace = true }
+# Function-URL bodies arrive base64-encoded (isBase64Encoded)
+base64 = { workspace = true }
+
+[dev-dependencies]
+# test-only `sign` helper; verification itself lives in types::sig
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
