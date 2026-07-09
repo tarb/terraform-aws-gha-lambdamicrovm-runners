@@ -1,0 +1,28 @@
+[package]
+name = "dispatcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+serde = { workspace = true }
+# preserve_order keeps log lines and wire payloads key-ordered exactly like
+# the Python dicts they mirror
+serde_json = { workspace = true, features = ["preserve_order"] }
+base64 = "0.22"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-lambdamicrovms = { workspace = true }
+aws-sdk-ssm = { workspace = true }
+aws-sdk-secretsmanager = { workspace = true }
+lambda_runtime = { workspace = true }
+aws_lambda_events = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

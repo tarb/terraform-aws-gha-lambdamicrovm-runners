@@ -1,0 +1,67 @@
+//! Environment configuration — identical names, parsing semantics and
+//! defaults to the module-level constants in `microvm/entrypoint.py`.
+//! Like the Python (which parses at import), an unparsable numeric env var
+//! is fatal at startup.
+
+/// Hook route prefix (not configurable, mirrors `HOOK_PREFIX`).
+pub const HOOK_PREFIX: &str = "/aws/lambda-microvms/runtime/v1";
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub hook_port: u16,
+    pub runner_dir: String,
+    pub gh_api: String,
+    pub enable_docker: bool,
+    pub docker_storage_driver: String,
+    pub nofile_soft: u64,
+    pub nofile_hard: u64,
+    pub idle_grace_seconds: i64,
+}
+
+impl Config {
+    pub fn from_env() -> Self {
+        Self {
+            hook_port: env_or("HOOK_PORT", "9000")
+                .parse()
+                .expect("HOOK_PORT must be an integer"),
+            runner_dir: env_or("RUNNER_DIR", "/opt/actions-runner"),
+            gh_api: env_or("GH_API_URL", "https://api.github.com"),
+            enable_docker: parse_flag(&env_or("ENABLE_DOCKER", "true")),
+            docker_storage_driver: env_or("DOCKER_STORAGE_DRIVER", "overlay2"),
+            nofile_soft: env_or("NOFILE_SOFT", "65536")
+                .parse()
+                .expect("NOFILE_SOFT must be an integer"),
+            nofile_hard: env_or("NOFILE_HARD", "1048576")
+                .parse()
+                .expect("NOFILE_HARD must be an integer"),
+            idle_grace_seconds: env_or("IDLE_GRACE_SECONDS", "120")
+                .parse()
+                .expect("IDLE_GRACE_SECONDS must be an integer"),
+        }
+    }
+}
+
+/// `os.environ.get(key, default)` — present-but-empty stays empty.
+pub fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Python flag parsing: `value.lower() in ("1", "true", "yes")`.
+pub fn parse_flag(value: &str) -> bool {
+    matches!(value.to_lowercase().as_str(), "1" | "true" | "yes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flag_parsing_matches_python() {
+        for v in ["1", "true", "TRUE", "True", "yes", "YES", "Yes"] {
+            assert!(parse_flag(v), "{v} should be true");
+        }
+        for v in ["0", "false", "no", "", "on", "enabled", "y"] {
+            assert!(!parse_flag(v), "{v} should be false");
+        }
+    }
+}

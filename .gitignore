@@ -1,0 +1,6 @@
+.terraform/
+.terraform-build/
+microvm/.artifacts/
+*.zip
+.terraform.lock.hcl
+target/

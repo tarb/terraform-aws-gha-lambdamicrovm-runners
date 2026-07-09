@@ -1,0 +1,23 @@
+[package]
+name = "entrypoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "sync"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-lambdamicrovms = { workspace = true }
+aws-sdk-ssm = { workspace = true }
+reqwest = { workspace = true }
+# In-guest supervisor needs raw rlimit/kill syscalls (no systemd in the VM).
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

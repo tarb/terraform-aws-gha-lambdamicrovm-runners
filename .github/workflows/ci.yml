@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.9.8"
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform validate
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: example validates
+        working-directory: examples/github-app
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      # Pinned to the version contributors run locally (`terraform-docs -c
+      # .terraform-docs.yml .`) so the generated block is byte-stable.
+      - name: terraform-docs drift
+        run: |
+          curl -fsSL https://github.com/terraform-docs/terraform-docs/releases/download/v0.24.0/terraform-docs-v0.24.0-linux-amd64.tar.gz \
+            | tar -xz terraform-docs
+          ./terraform-docs -c .terraform-docs.yml .
+          rm terraform-docs
+          git diff --exit-code README.md || {
+            echo "README.md terraform-docs block is stale - run: terraform-docs -c .terraform-docs.yml ." >&2
+            exit 1
+          }
+
+  rust:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: test
+        run: cargo test --workspace -q

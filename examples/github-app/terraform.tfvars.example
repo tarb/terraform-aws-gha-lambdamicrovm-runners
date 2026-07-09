@@ -1,0 +1,14 @@
+region              = "us-east-1"
+name_prefix         = "gha-microvm"
+github_organization = "my-org"
+github_repositories = ["my-org/api", "my-org/web"] # or [] for an org-level webhook
+app_id              = "123456"
+app_installation_id = "12345678"
+
+# PEM contents. Prefer keeping this out of source control — e.g. set it via
+# TF_VAR_app_private_key, or replace the heredoc with:  file("app.private-key.pem")
+app_private_key = <<-EOT
+-----BEGIN RSA PRIVATE KEY-----
+...paste the GitHub App private key here...
+-----END RSA PRIVATE KEY-----
+EOT

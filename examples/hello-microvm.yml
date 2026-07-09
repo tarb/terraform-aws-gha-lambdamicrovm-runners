@@ -1,0 +1,25 @@
+# Minimal workflow that runs on the Lambda MicroVM self-hosted runner.
+# Put this in your test repo at: .github/workflows/hello-microvm.yml
+# Then trigger it from the Actions tab ("Run workflow") — it targets the
+# runner labels the MicroVM registers with.
+name: hello-microvm
+on:
+  workflow_dispatch:     # manual "Run workflow" button
+  push:
+    branches: [ main ]
+
+jobs:
+  hello:
+    runs-on: [self-hosted, linux, arm64, microvm]
+    steps:
+      - name: Show where we are running
+        run: |
+          echo "Hello from a GitHub Actions runner inside an AWS Lambda MicroVM!"
+          echo "host: $(uname -a)"
+          echo "arch: $(uname -m)         # expect aarch64 (Graviton)"
+          echo "whoami: $(whoami)"
+          echo "cpus: $(nproc)  mem: $(free -h | awk '/Mem:/{print $2}')"
+      - name: Checkout this repo (uses the bundled runner tooling)
+        uses: actions/checkout@v4
+      - name: List the checkout
+        run: ls -la

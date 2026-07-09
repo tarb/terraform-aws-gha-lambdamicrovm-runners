@@ -1,0 +1,45 @@
+# Exercises Docker on the Lambda MicroVM runner (needs the default Docker-enabled
+# image: dockerd + additional_os_capabilities = ["ALL"], both on by default).
+# Put at: .github/workflows/docker-microvm.yml — trigger from the Actions tab.
+name: docker-microvm
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  docker-run:
+    runs-on: [self-hosted, linux, arm64, microvm]
+    steps:
+      - name: docker available?
+        run: docker version
+      - name: run a container
+        run: docker run --rm hello-world
+      - name: nested container arch
+        run: docker run --rm alpine uname -m   # expect aarch64
+      - name: container fd limits            # guest default is 1024 hard; entrypoint must raise it
+        run: |
+          hard=$(docker run --rm alpine sh -c 'ulimit -Hn')
+          echo "container hard nofile: $hard (want >= 65536)"
+          [ "$hard" -ge 65536 ]
+      - name: buildkit fd limits             # BuildKit ignores --default-ulimit; needs dockerd's own rlimit raised
+        run: |
+          printf 'FROM alpine\nRUN ulimit -n "$(ulimit -Hn)" && echo "build hard nofile: $(ulimit -Hn)" && [ "$(ulimit -Hn)" -ge 65536 ]\n' \
+            | docker build --no-cache --progress=plain -
+
+  in-container:                 # the whole job runs inside a container on the runner
+    runs-on: [self-hosted, linux, arm64, microvm]
+    container: node:20-alpine
+    steps:
+      - run: node --version && head -1 /etc/os-release
+
+  with-service:                 # a service container alongside the job
+    runs-on: [self-hosted, linux, arm64, microvm]
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: [ "6379:6379" ]
+    steps:
+      - run: |
+          # redis CLI via the service container's image
+          docker run --rm --network host redis:7-alpine redis-cli -h 127.0.0.1 ping

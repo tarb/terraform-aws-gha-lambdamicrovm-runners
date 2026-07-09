@@ -1,0 +1,56 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  artifacts:
+    # Native arm64 build for the arm64 Lambda + microVM targets — no cross toolchain.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install cargo-lambda + musl tools
+        run: |
+          pip install cargo-lambda
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+
+      - name: gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace -- -D warnings
+          cargo test --workspace -q
+
+      - name: build lambda zips (provided.al2023, arm64)
+        run: |
+          cargo lambda build --release --arm64 -p dispatcher -p webhook-proxy --output-format zip
+          mv target/lambda/dispatcher/bootstrap.zip dispatcher.zip
+          mv target/lambda/webhook-proxy/bootstrap.zip webhook-proxy.zip
+
+      - name: build entrypoint (static musl)
+        run: |
+          cargo build --release --target aarch64-unknown-linux-musl -p entrypoint
+          cp target/aarch64-unknown-linux-musl/release/entrypoint entrypoint
+          file entrypoint | grep -q "statically linked" || { echo "entrypoint is not static"; exit 1; }
+
+      - name: checksums
+        run: sha256sum dispatcher.zip webhook-proxy.zip entrypoint > SHA256SUMS
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dispatcher.zip webhook-proxy.zip entrypoint SHA256SUMS
