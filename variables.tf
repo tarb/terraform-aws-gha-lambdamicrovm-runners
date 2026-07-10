@@ -29,7 +29,7 @@ variable "artifacts_bucket_name" {
 variable "artifact_version" {
   description = "GitHub release of this module whose prebuilt artifacts (dispatcher.zip, webhook-proxy.zip, entrypoint) are deployed; releases are built by .github/workflows/release.yml."
   type        = string
-  default     = "v0.0.4"
+  default     = "v0.0.5"
 }
 
 ###############################################################################
@@ -211,6 +211,23 @@ variable "egress_network_connector_arn" {
   description = "Customer-managed Lambda network connector ARN for VPC egress (reach private resources: VPC endpoints, internal services, private cluster APIs). null = AWS-managed INTERNET_EGRESS."
   type        = string
   default     = null
+}
+
+variable "disable_guest_ipv6" {
+  description = <<-EOT
+    Disable IPv6 inside guest MicroVMs. Set true when the egress connector is
+    IPv4-only (NetworkConnector VpcEgressConfiguration network_protocol =
+    "IPv4"): the guest can't tell, so dual-stack clients (observed: bun's
+    highly concurrent package fetches) burn a happy-eyeballs IPv6 attempt per
+    connection against a protocol that can never work — a per-connection tax
+    that turned a ~1min install into ~11min. Implemented by baking
+    DISABLE_IPV6=1 into the image environment (changing this triggers an
+    image rebuild); the supervisor then writes the kernel's disable_ipv6
+    sysctls at boot. Leave false for DualStack connectors and the managed
+    INTERNET_EGRESS default.
+  EOT
+  type        = bool
+  default     = false
 }
 
 variable "runner_environment_variables" {

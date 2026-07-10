@@ -22,6 +22,7 @@ mod docker;
 mod gate;
 mod github;
 mod handoff;
+mod ipv6;
 mod logfmt;
 mod payload;
 mod pool;
@@ -47,6 +48,10 @@ async fn main() {
     ));
     // Before any child: dockerd + runner inherit these.
     rlimit::raise_nofile_rlimit(&cfg);
+    // Also before any child: on a v4-only egress connector, kill guest IPv6
+    // so dual-stack clients don't burn a doomed happy-eyeballs attempt per
+    // connection (see ipv6.rs). No-op unless DISABLE_IPV6 is set.
+    ipv6::disable_ipv6_if_requested();
     // dockerd is NOT started here: it comes up fresh per job in the run
     // task so its bridge/NAT/DNS reflect the live MicroVM network.
     let region = config::region_label();

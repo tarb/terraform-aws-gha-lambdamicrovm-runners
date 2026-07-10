@@ -32,9 +32,13 @@ resource "awscc_lambda_microvm_image" "runner" {
   egress_network_connectors  = [local.egress_connector_arn]
   # Cloud Control marks EnvironmentVariables as a required key and the provider
   # omits an empty set, so ship one harmless marker. The runner's real config
-  # comes from the Dockerfile ENV, not from here.
+  # comes from the Dockerfile ENV, not from here. DISABLE_IPV6 makes the
+  # supervisor flip the guest's disable_ipv6 sysctls at boot — for IPv4-only
+  # egress connectors, where dual-stack clients otherwise waste a doomed
+  # happy-eyeballs IPv6 attempt per connection.
   environment_variables = concat(
     [{ key = "GHA_RUNNER_MICROVM", value = "1" }],
+    var.disable_guest_ipv6 ? [{ key = "DISABLE_IPV6", value = "1" }] : [],
     [for k, v in var.runner_environment_variables : { key = k, value = v }],
   )
 

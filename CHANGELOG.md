@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
 module's release tags (`artifact_version`).
 
+## [v0.0.5]
+
+### Added
+
+- **Optional guest IPv6 disable** — new `disable_guest_ipv6` Terraform
+  variable (default `false`). Why: the fleet's egress connector can be
+  IPv4-only (NetworkConnector VpcEgressConfiguration `network_protocol =
+  "IPv4"`), but the guest has no way to know — dual-stack clients (observed:
+  bun's highly concurrent package fetches) burn a happy-eyeballs IPv6
+  attempt per connection against a protocol that can never work, a
+  per-connection tax that turned a ~1min install into ~11min. When the
+  operator knows the connector is v4-only, setting the variable bakes
+  `DISABLE_IPV6=1` into the image environment (so flipping it triggers an
+  image rebuild) and the supervisor writes `1` to
+  `/proc/sys/net/ipv6/conf/{all,default}/disable_ipv6` at boot, before any
+  child spawns — removing the entire class. Absent sysctl paths (kernel
+  without IPv6) and write failures are tolerated with a WARN each; success
+  logs `ipv6 disabled (DISABLE_IPV6 set - v4-only egress)`. Default stays
+  off because DualStack connectors (and the managed INTERNET_EGRESS default)
+  want IPv6 intact.
+
 ## [v0.0.4]
 
 ### Added

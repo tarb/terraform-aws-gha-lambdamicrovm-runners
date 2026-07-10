@@ -294,6 +294,14 @@ dispatcher's `iam:PassRole` is scoped to the exec role ARN only.
   `VPC_EGRESS` connector if you need private networking / a fixed egress IP (then
   the control-plane self-terminate call needs a NAT or an `lambda-microvms`
   interface VPC endpoint).
+- **IPv6** - if your egress connector is IPv4-only (VpcEgressConfiguration
+  `network_protocol = "IPv4"`), set `disable_guest_ipv6 = true`: the guest can't
+  tell the connector is v4-only, so dual-stack clients (observed: bun's highly
+  concurrent package fetches) waste a happy-eyeballs IPv6 attempt per connection
+  against a protocol that can never work — a per-connection tax that turned a
+  ~1min install into ~11min. The flag bakes `DISABLE_IPV6=1` into the image env
+  (an image rebuild) and the supervisor flips the kernel's `disable_ipv6`
+  sysctls at boot; leave it off for DualStack connectors.
 - **Ingress** - the runner needs **none** (it dials out to GitHub). GitHub POSTs
   webhooks to the *webhook-proxy*'s public **Lambda Function URL** (authType NONE),
   which gives GitHub a plain public `https://…/` to POST to; events then reach the
