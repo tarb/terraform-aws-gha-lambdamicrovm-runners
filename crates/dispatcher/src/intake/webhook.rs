@@ -87,6 +87,7 @@ impl WebhookPayload {
             repo: self.repo()?.to_string(),
             job_id: self.job_id(),
             installation: self.installation_id(),
+            labels: self.labels(),
         })
     }
 }
@@ -113,6 +114,19 @@ mod tests {
         let empty: WebhookPayload = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(empty.runner_name(), "");
         assert!(empty.labels().is_empty());
+    }
+
+    #[test]
+    fn job_ref_carries_the_requested_labels() {
+        let p: WebhookPayload = serde_json::from_value(serde_json::json!({
+            "action": "queued",
+            "workflow_job": {"id": 5, "labels": ["self-hosted", "microvm", "docker"]},
+            "repository": {"full_name": "o/r"},
+        }))
+        .unwrap();
+        let job = p.job_ref().unwrap();
+        assert_eq!(job.labels, p.labels());
+        assert!(job.labels.contains("docker"));
     }
 
     #[test]

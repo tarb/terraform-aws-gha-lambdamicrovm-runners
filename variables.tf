@@ -29,7 +29,7 @@ variable "artifacts_bucket_name" {
 variable "artifact_version" {
   description = "GitHub release of this module whose prebuilt artifacts (dispatcher.zip, webhook-proxy.zip, entrypoint) are deployed; releases are built by .github/workflows/release.yml."
   type        = string
-  default     = "v0.0.3"
+  default     = "v0.0.4"
 }
 
 ###############################################################################
@@ -244,6 +244,22 @@ variable "warm_pool" {
     max_size = optional(number, 4)
   })
   default = {}
+}
+
+variable "docker_default" {
+  description = <<-EOT
+    Whether jobs get Docker (dockerd + the wait-for-docker job-started hook)
+    when their runs-on labels do NOT include the extra "docker" label. A job
+    that requests the "docker" label always gets it. true (default): every
+    job gets Docker — the pre-v0.0.4 behavior. Migration to label opt-in:
+    first add "docker" to the runs-on labels of the jobs that need it (e.g.
+    [self-hosted, microvm, docker]), then set docker_default = false so
+    unlabeled jobs go lightweight — they skip dockerd startup (the
+    page-in-heavy part of a cold boot) and never stall on the hook.
+    -> DOCKER_DEFAULT.
+  EOT
+  type        = bool
+  default     = true
 }
 
 variable "event_pattern_label" {

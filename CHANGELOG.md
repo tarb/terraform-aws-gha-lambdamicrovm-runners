@@ -4,9 +4,49 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
 module's release tags (`artifact_version`).
 
-## [Unreleased]
+## [v0.0.4]
+
+### Added
+
+- **Docker on demand** — docker (dockerd + the wait-for-docker job-started
+  hook) is now a per-job capability instead of an unconditional per-VM one.
+  Non-docker jobs no longer pay dockerd's startup — the page-in-heavy part
+  of a cold boot — and never stall on the hook. How it works: a job opts in
+  by carrying the extra `docker` label in `runs-on` (matched
+  case-insensitively, like GitHub's own label matching); the new
+  `docker_default` Terraform variable (→ dispatcher env `DOCKER_DEFAULT`,
+  default `true`) decides for unlabeled jobs. The dispatcher stamps the
+  decision into the run payload as the new optional `enable_docker` field
+  and registers the runner with the UNION of the configured `runner_labels`
+  and the job's requested labels (a job requesting `docker` can only be
+  assigned to a runner registered with it). The entrypoint starts dockerd
+  and injects `ACTIONS_RUNNER_HOOK_JOB_STARTED` (the wait-for-docker gate)
+  into the runner process ONLY for docker-enabled runs; the image no longer
+  bakes that ENV. Warm-pool transitions work in both directions: cleanup
+  already tears dockerd down between jobs, and each handoff payload decides
+  afresh. Back-compat both ways: payloads from old dispatchers lack the
+  field and the entrypoint falls back to the image's `ENABLE_DOCKER` env
+  (docker on, exactly as before); old entrypoints ignore the new field.
+  Migration to label opt-in: label your docker jobs with `docker` in
+  `runs-on` first, then set `docker_default = false` so unlabeled jobs go
+  lightweight. Defaults preserve today's behavior.
 
 ### Fixed
+
+- **wait-for-docker + dockerd startup hardening** — the wait-for-docker
+  hook's budget is now wall clock (bash `SECONDS`) instead of an iteration
+  count (blocking `docker info` probes could stretch "150s" to 4m30s of real
+  time), each probe is bounded by `timeout` (`DOCKER_CHECK_TIMEOUT`, default
+  5 s — a hung `docker info` against a stale socket used to stall the hook
+  indefinitely), and on final timeout the hook prints the tail of
+  `/tmp/dockerd.log` to stderr so the failure diagnoses itself in the job
+  log. The dockerd supervisor got the matching fixes: stale pid/socket files
+  (docker.pid, docker.sock, containerd pid/sock — snapshot remnants that
+  abort or wedge a fresh dockerd) are removed before EVERY launch attempt,
+  not just between passes; the between-pass reaper now clears pid files too;
+  and every supervisor readiness probe is bounded with a wall-clock
+  per-driver window, so a wedged daemon gets killed and retried instead of
+  waited on forever.
 
 - **Dispatch stampede vs. the microvm control plane** — a burst of
   simultaneous `workflow_job` webhooks (N parallel dispatcher invokes) used

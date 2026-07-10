@@ -33,9 +33,12 @@ pub async fn run_task(app: Arc<AppState>, cfg: RunConfig) {
     // Resumed mid-cleanup: let the previous cycle's teardown finish before
     // registering (bounded — cleanup is seconds of work).
     app.gate.await_cleaning_done(Duration::from_secs(30)).await;
-    // Warm dockerd up in the BACKGROUND so it overlaps registration and the
-    // GitHub job-assignment handshake instead of blocking before them.
-    if app.cfg.enable_docker {
+    // Docker is a PER-RUN capability (payload decision, ENABLE_DOCKER env
+    // fallback): a non-docker run never pays dockerd's startup — the
+    // page-in-heavy part of a cold boot. Warm it up in the BACKGROUND so it
+    // overlaps registration and the GitHub job-assignment handshake instead
+    // of blocking before them.
+    if cfg.docker_enabled(&app.cfg) {
         tokio::spawn(app.docker.clone().ensure());
     }
     if let Err(e) = flow(&app, &cfg).await {
@@ -63,7 +66,11 @@ async fn flow(app: &Arc<AppState>, cfg: &RunConfig) -> Result<(), LaunchError> {
         app.runner.lock().unwrap().registration = Some(dereg.clone());
     }
     log("launching runner");
-    let proc = spawn(prepared.command(), &app.cfg.runner_dir)?;
+    let proc = spawn(
+        prepared.command(),
+        &app.cfg.runner_dir,
+        cfg.docker_enabled(&app.cfg),
+    )?;
     app.runner.lock().unwrap().proc = Some(proc.handle());
     if ephemeral {
         // Persistent runners legitimately idle between jobs; only the
@@ -167,11 +174,30 @@ pub struct ExitReport {
     pub watchdog_fired: bool,
 }
 
-pub fn spawn(cmd: RunnerCommand, cwd: &str) -> Result<RunnerProcess, LaunchError> {
-    let child = tokio::process::Command::new(&cmd.program)
+/// Spawn the runner. `docker_enabled` decides the job-started hook: the
+/// image no longer bakes `ACTIONS_RUNNER_HOOK_JOB_STARTED`, so the wait-
+/// for-docker gate exists exactly for the runs that start dockerd — a
+/// non-docker run's first step is never stalled by it (env_remove guards
+/// against legacy images that still bake the ENV).
+pub fn spawn(
+    cmd: RunnerCommand,
+    cwd: &str,
+    docker_enabled: bool,
+) -> Result<RunnerProcess, LaunchError> {
+    let mut command = tokio::process::Command::new(&cmd.program);
+    command
         .args(&cmd.args)
         .current_dir(cwd)
-        .env("RUNNER_ALLOW_RUNASROOT", "1")
+        .env("RUNNER_ALLOW_RUNASROOT", "1");
+    if docker_enabled {
+        command.env(
+            "ACTIONS_RUNNER_HOOK_JOB_STARTED",
+            crate::config::WAIT_FOR_DOCKER_HOOK,
+        );
+    } else {
+        command.env_remove("ACTIONS_RUNNER_HOOK_JOB_STARTED");
+    }
+    let child = command
         .spawn()
         .map_err(|e| LaunchError::Spawn(e.to_string()))?;
     let pid = child.id().map(|p| p as i32).unwrap_or(0);
@@ -330,6 +356,73 @@ mod tests {
         assert_eq!(ExitPolicy::decide(false, true, true), SelfTerminate);
         assert_eq!(ExitPolicy::decide(true, false, false), PersistentIdle);
         assert_eq!(ExitPolicy::decide(false, false, true), PersistentIdle);
+    }
+
+    #[tokio::test]
+    async fn spawn_injects_the_hook_env_only_for_docker_runs() {
+        use crate::config::WAIT_FOR_DOCKER_HOOK;
+        use crate::state::testsupport::temp_dir;
+        let dir = temp_dir("spawn-hook-env");
+        // Exits 0 iff the child sees the hook env with exactly the baked path.
+        let probe = RunnerCommand {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "test \"${{ACTIONS_RUNNER_HOOK_JOB_STARTED:-}}\" = \"{WAIT_FOR_DOCKER_HOOK}\""
+                ),
+            ],
+        };
+        let on = spawn(probe.clone(), &dir, true).unwrap();
+        assert_eq!(
+            on.wait().await.unwrap().code,
+            0,
+            "docker-enabled run must see the wait-for-docker hook"
+        );
+        let off = spawn(probe.clone(), &dir, false).unwrap();
+        assert_ne!(
+            off.wait().await.unwrap().code,
+            0,
+            "non-docker run must not see the hook env"
+        );
+        // Legacy images bake the ENV image-wide; a non-docker run on one
+        // must still strip it (env_remove), or its first step stalls on the
+        // wait-for-docker timeout.
+        unsafe { std::env::set_var("ACTIONS_RUNNER_HOOK_JOB_STARTED", WAIT_FOR_DOCKER_HOOK) };
+        let legacy = spawn(probe, &dir, false).unwrap();
+        let code = legacy.wait().await.unwrap().code;
+        unsafe { std::env::remove_var("ACTIONS_RUNNER_HOOK_JOB_STARTED") };
+        assert_ne!(code, 0, "a baked image ENV must be stripped");
+    }
+
+    #[test]
+    fn pooled_transitions_decide_docker_per_run_not_per_vm() {
+        // docker job -> suspend -> non-docker job -> suspend -> docker job:
+        // each handoff payload resolves independently (pool_cleanup tears
+        // dockerd down between jobs; the next run's payload alone decides
+        // whether it comes back). An old-dispatcher handoff mid-sequence
+        // falls back to the ENABLE_DOCKER env.
+        use crate::state::testsupport::test_config;
+        let mut env = test_config("/nonexistent");
+        env.enable_docker = true; // the image's legacy default
+        let seq = [
+            (json!({"pool": true, "enable_docker": true}), true),
+            (json!({"pool": true, "enable_docker": false}), false),
+            (json!({"pool": true, "enable_docker": true}), true),
+            (json!({"pool": true}), true), // old dispatcher: env fallback
+        ];
+        for (payload, want) in seq {
+            assert_eq!(
+                RunConfig::from_value(payload.clone()).docker_enabled(&env),
+                want,
+                "{payload}"
+            );
+        }
+        env.enable_docker = false;
+        assert!(
+            !RunConfig::from_value(json!({"pool": true})).docker_enabled(&env),
+            "env fallback follows ENABLE_DOCKER=false too"
+        );
     }
 
     #[tokio::test(start_paused = true)]

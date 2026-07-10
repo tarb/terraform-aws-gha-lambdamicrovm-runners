@@ -39,8 +39,10 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() {
     let cfg = config::Config::from_env();
+    // Docker is decided per run by the payload's enable_docker; the env
+    // value logged here is only the fallback for old-dispatcher payloads.
     log(format!(
-        "hook server on 0.0.0.0:{} (runner dir {}, docker={})",
+        "hook server on 0.0.0.0:{} (runner dir {}, docker env fallback={})",
         cfg.hook_port, cfg.runner_dir, cfg.enable_docker
     ));
     // Before any child: dockerd + runner inherit these.

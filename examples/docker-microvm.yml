@@ -1,5 +1,8 @@
 # Exercises Docker on the Lambda MicroVM runner (needs the default Docker-enabled
 # image: dockerd + additional_os_capabilities = ["ALL"], both on by default).
+# The extra "docker" runs-on label opts each job into Docker explicitly — it is
+# redundant while docker_default = true (the default), but required once you
+# migrate to docker_default = false ("Docker on demand" in docs/USAGE.md).
 # Put at: .github/workflows/docker-microvm.yml — trigger from the Actions tab.
 name: docker-microvm
 on:
@@ -9,7 +12,7 @@ on:
 
 jobs:
   docker-run:
-    runs-on: [self-hosted, linux, arm64, microvm]
+    runs-on: [self-hosted, linux, arm64, microvm, docker]
     steps:
       - name: docker available?
         run: docker version
@@ -28,13 +31,13 @@ jobs:
             | docker build --no-cache --progress=plain -
 
   in-container:                 # the whole job runs inside a container on the runner
-    runs-on: [self-hosted, linux, arm64, microvm]
+    runs-on: [self-hosted, linux, arm64, microvm, docker]
     container: node:20-alpine
     steps:
       - run: node --version && head -1 /etc/os-release
 
   with-service:                 # a service container alongside the job
-    runs-on: [self-hosted, linux, arm64, microvm]
+    runs-on: [self-hosted, linux, arm64, microvm, docker]
     services:
       redis:
         image: redis:7-alpine

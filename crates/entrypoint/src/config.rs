@@ -12,11 +12,21 @@ pub const HOOK_PREFIX: &str = "/aws/lambda-microvms/runtime/v1";
 /// provides any.
 pub const DEFAULT_LABELS: &str = "self-hosted,linux,arm64,microvm";
 
+/// The job-started hook baked into the image (microvm/Dockerfile). The
+/// supervisor injects it as `ACTIONS_RUNNER_HOOK_JOB_STARTED` into the
+/// Runner.Listener environment per run, ONLY when docker is enabled for
+/// that run — it is deliberately NOT an image-wide ENV, so non-docker jobs
+/// never stall on the wait-for-docker gate.
+pub const WAIT_FOR_DOCKER_HOOK: &str = "/opt/actions-runner-hooks/wait-for-docker.sh";
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub hook_port: u16,
     pub runner_dir: String,
     pub gh_api: String,
+    /// Legacy fallback knob (`ENABLE_DOCKER`): consulted only when the /run
+    /// payload lacks `enable_docker` (old-dispatcher payloads then behave
+    /// exactly as before). New dispatchers decide per job.
     pub enable_docker: bool,
     pub docker_storage_driver: String,
     pub nofile_soft: u64,

@@ -117,6 +117,7 @@ resource "aws_lambda_function" "dispatcher" {
       RUNNER_LABELS         = join(",", var.runner_labels)
       GH_API_URL            = var.github_api_url
       MAX_CONCURRENCY       = tostring(var.max_concurrency)
+      DOCKER_DEFAULT        = var.docker_default ? "true" : "false"
       HANDOFF_PREFIX        = "/${var.name_prefix}/handoff"
       POOL_ENABLED          = var.warm_pool.enabled ? "true" : "false"
       POOL_MAX_SIZE         = tostring(var.warm_pool.max_size)

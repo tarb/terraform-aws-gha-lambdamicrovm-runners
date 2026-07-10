@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "dispatcher"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -1055,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "entrypoint"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3128,7 +3128,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "types"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "hex",
  "hmac 0.13.0",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "webhook-proxy"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-trait",
  "aws-config",

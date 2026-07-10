@@ -183,10 +183,42 @@ In GitHub (repo or org **Settings → Webhooks → Add webhook**):
 | `additional_os_capabilities` | `["ALL"]` | `["ALL"]` enables nested Docker; `[]` to tighten. |
 | `required_labels` | `["self-hosted","microvm"]` | Labels a job must carry to trigger a MicroVM. |
 | `runner_labels` | `["self-hosted","linux","arm64","microvm"]` | Labels the runner registers with. |
+| `docker_default` | `true` | Docker for jobs without the `docker` label — see [Docker on demand](#docker-on-demand). |
 | `log_retention_days` | `14` | CloudWatch retention. |
 | `github_api_url` | `https://api.github.com` | Set for GitHub Enterprise Server. |
 
 See [`variables.tf`](../variables.tf) for the full set (validations, dispatcher sizing, base image name, bucket override).
+
+## Docker on demand
+
+Docker is a per-job capability selected by a runner label. A job that puts the
+extra `docker` label in its `runs-on` gets dockerd started for it (plus the
+wait-for-docker job-started hook that keeps its first step from racing the
+daemon); the dispatcher registers that runner with the union of `runner_labels`
+and the job's requested labels, so the assignment matches:
+
+```yaml
+jobs:
+  build-image:
+    runs-on: [self-hosted, microvm, docker]   # opts into docker
+    steps:
+      - run: docker build .
+  unit-tests:
+    runs-on: [self-hosted, microvm]           # lightweight when docker_default = false
+    steps:
+      - run: cargo test
+```
+
+`docker_default` decides for jobs **without** the label:
+
+- `true` (default) — every job gets Docker; nothing changes from earlier
+  releases.
+- `false` — unlabeled jobs skip dockerd entirely: no daemon startup (the
+  page-in-heavy part of a cold boot) and no readiness hook to wait on.
+
+**Migration path**: add `docker` to the `runs-on` of the jobs that actually use
+`docker` / `container:` / `services:` first, then set `docker_default = false`
+so everything else goes lightweight.
 
 ## Outputs
 
@@ -249,8 +281,11 @@ Notes:
 
 - `microvm/wait-for-docker.sh` is always staged into the build context, so a
   custom Dockerfile can keep the built-in job-started hook
-  (`COPY wait-for-docker.sh /opt/actions-runner-hooks/...` +
-  `ACTIONS_RUNNER_HOOK_JOB_STARTED`) that gates jobs until dockerd is up.
+  (`COPY wait-for-docker.sh /opt/actions-runner-hooks/wait-for-docker.sh`)
+  that gates docker jobs until dockerd is up. Do NOT set
+  `ACTIONS_RUNNER_HOOK_JOB_STARTED` as an image ENV: the supervisor injects
+  it per-run, only for docker-enabled jobs (see
+  [Docker on demand](#docker-on-demand)).
 - A `Dockerfile` inside `build_context_dir` is ignored (overwritten): the only
   Dockerfile override path is `dockerfile`, which carries the validation.
 - Changing `dockerfile` or any file under `build_context_dir` re-stages the

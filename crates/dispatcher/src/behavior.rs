@@ -11,17 +11,22 @@ use crate::dispatch::{DispatchError, JobRef};
 use crate::github::GithubError;
 use crate::github::types::{InstallationId, JobInfo, RepoRef, RunnerInfo, WorkflowRun};
 use crate::handler;
-use crate::intake::webhook::WebhookPayload;
+use crate::intake::webhook::{LabelSet, WebhookPayload};
 use crate::oplog;
 use crate::pool::{IntakeOutcome, ResumeOutcome};
 use crate::sweep::Deadline;
 use crate::testsupport::*;
 
 fn job_ref(repo: &str, job_id: i64) -> JobRef {
+    job_ref_labeled(repo, job_id, &[])
+}
+
+fn job_ref_labeled(repo: &str, job_id: i64, labels: &[&str]) -> JobRef {
     JobRef {
         repo: repo.to_string(),
         job_id: Some(job_id),
         installation: Some(InstallationId(1)),
+        labels: labels.iter().map(|s| s.to_string()).collect::<LabelSet>(),
     }
 }
 
@@ -780,11 +785,86 @@ async fn cold_launch_payload_has_exactly_the_job_fields() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, vec!["ephemeral", "github_url", "labels", "token"]);
+    assert_eq!(
+        keys,
+        vec![
+            "enable_docker",
+            "ephemeral",
+            "github_url",
+            "labels",
+            "token"
+        ]
+    );
     assert_eq!(payload["github_url"], "https://github.com/org/repo");
     assert_eq!(payload["token"], "tok");
     assert_eq!(payload["ephemeral"], true);
     assert_eq!(payload["labels"], "self-hosted,linux,arm64,microvm");
+    assert_eq!(
+        payload["enable_docker"], true,
+        "DOCKER_DEFAULT unset means every job gets docker"
+    );
+}
+
+#[tokio::test]
+async fn docker_label_opts_the_job_in_and_default_polarity_holds() {
+    // docker_default=false: only the "docker" label enables docker, and the
+    // requested labels are unioned into the registration labels.
+    let (svc, f) = harness_with(|c| c.docker_default = false);
+    svc.dispatcher
+        .dispatch(&job_ref_labeled(
+            "org/repo",
+            7,
+            &["self-hosted", "microvm", "docker"],
+        ))
+        .await
+        .unwrap();
+    svc.dispatcher
+        .dispatch(&job_ref_labeled("org/repo", 8, &["self-hosted", "microvm"]))
+        .await
+        .unwrap();
+    let specs = f.mv.run_specs.lock().unwrap();
+    let labeled: Value = serde_json::from_str(&specs[0].run_hook_payload).unwrap();
+    assert_eq!(labeled["enable_docker"], true);
+    assert_eq!(
+        labeled["labels"], "self-hosted,linux,arm64,microvm,docker",
+        "static set first (order kept), new requested labels appended"
+    );
+    let unlabeled: Value = serde_json::from_str(&specs[1].run_hook_payload).unwrap();
+    assert_eq!(unlabeled["enable_docker"], false);
+    assert_eq!(unlabeled["labels"], "self-hosted,linux,arm64,microvm");
+}
+
+#[tokio::test]
+async fn docker_default_true_enables_docker_without_the_label() {
+    let (svc, f) = harness(); // docker_default defaults to true
+    svc.dispatcher
+        .dispatch(&job_ref_labeled("org/repo", 7, &["self-hosted", "microvm"]))
+        .await
+        .unwrap();
+    let specs = f.mv.run_specs.lock().unwrap();
+    let payload: Value = serde_json::from_str(&specs[0].run_hook_payload).unwrap();
+    assert_eq!(payload["enable_docker"], true);
+}
+
+#[tokio::test]
+async fn parked_pool_handoff_carries_enable_docker() {
+    // The mailbox copy is the same payload the cold launch would get, so a
+    // resumed VM learns its docker capability too.
+    let (svc, f) = harness_with(|c| {
+        c.pool_enabled = true;
+        c.docker_default = false;
+    });
+    f.mv.set_vms(vec![vm("SUSPENDED")]);
+    *f.mv.state.lock().unwrap() = Some(Ok(crate::fleet::MicrovmState::Suspended));
+    arm_claimed_handoff(&f);
+    svc.dispatcher
+        .dispatch(&job_ref_labeled("org/repo", 7, &["docker"]))
+        .await
+        .unwrap();
+    let puts = f.params.puts.lock().unwrap();
+    assert_eq!(puts.len(), 1, "payload parked in the mailbox");
+    let parked: Value = serde_json::from_str(&puts[0].1).unwrap();
+    assert_eq!(parked["enable_docker"], true);
 }
 
 #[tokio::test]
@@ -806,6 +886,7 @@ async fn pooled_cold_launch_payload_adds_the_pool_fields() {
     assert_eq!(
         keys,
         vec![
+            "enable_docker",
             "ephemeral",
             "github_url",
             "handoff_prefix",

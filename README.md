@@ -53,6 +53,24 @@ module "gha_runner" {
 Then run a workflow with `runs-on: [self-hosted, linux, arm64, microvm]`. A runnable
 copy is in [`examples/github-app`](examples/github-app).
 
+## Docker on demand
+
+Docker is a **per-job capability**, selected by a runner label: a job that adds
+the extra `docker` label to its `runs-on` (e.g.
+`runs-on: [self-hosted, microvm, docker]`) gets dockerd plus the
+wait-for-docker job-started hook; other jobs are governed by the
+`docker_default` variable.
+
+- `docker_default = true` (the default): **every** job gets Docker — identical
+  to pre-v0.0.4 behavior, no workflow changes needed.
+- `docker_default = false`: only `docker`-labeled jobs get it. Unlabeled jobs
+  go lightweight — they skip dockerd startup (the page-in-heavy part of a cold
+  boot) and never wait on the docker-readiness hook.
+
+Migration path: first add the `docker` label to the `runs-on` of the jobs that
+actually use `docker` / `container:` / `services:`, then flip
+`docker_default = false`.
+
 ## Custom image
 
 The runner image definition can be replaced without forking the module:
@@ -194,13 +212,14 @@ No modules.
 | ---- | ----------- | ---- | ------- | :------: |
 | <a name="input_additional_execution_policy_arns"></a> [additional\_execution\_policy\_arns](#input\_additional\_execution\_policy\_arns) | Extra IAM policy ARNs attached to the MicroVM execution role (e.g. sccache cache-bucket access, ECR push). | `list(string)` | `[]` | no |
 | <a name="input_additional_os_capabilities"></a> [additional\_os\_capabilities](#input\_additional\_os\_capabilities) | additionalOsCapabilities for the MicroVM image. ["ALL"] enables nested Docker / privileged ops (needed for `docker`/`services:` jobs). Set [] to tighten for non-Docker workloads. | `list(string)` | <pre>[<br/>  "ALL"<br/>]</pre> | no |
-| <a name="input_artifact_version"></a> [artifact\_version](#input\_artifact\_version) | GitHub release of this module whose prebuilt artifacts (dispatcher.zip, webhook-proxy.zip, entrypoint) are deployed; releases are built by .github/workflows/release.yml. | `string` | `"v0.0.3"` | no |
+| <a name="input_artifact_version"></a> [artifact\_version](#input\_artifact\_version) | GitHub release of this module whose prebuilt artifacts (dispatcher.zip, webhook-proxy.zip, entrypoint) are deployed; releases are built by .github/workflows/release.yml. | `string` | `"v0.0.4"` | no |
 | <a name="input_artifacts_bucket_name"></a> [artifacts\_bucket\_name](#input\_artifacts\_bucket\_name) | Override the S3 artifacts bucket name. Default (null) creates one named '<name\_prefix>-artifacts-<account\_id>'. | `string` | `null` | no |
 | <a name="input_base_image_name"></a> [base\_image\_name](#input\_base\_image\_name) | AWS-managed MicroVM base image short name, resolved to arn:aws:lambda:<region>:aws:microvm-image:<name>. | `string` | `"al2023-1"` | no |
 | <a name="input_base_image_version"></a> [base\_image\_version](#input\_base\_image\_version) | Major version of the AWS-managed base image (base\_image\_name), as a single number (e.g. "0"). Cloud Control requires it and validates the format. | `string` | `"0"` | no |
 | <a name="input_build_context_dir"></a> [build\_context\_dir](#input\_build\_context\_dir) | Path to a directory whose files are added to the image build context<br/>alongside the Dockerfile (so a custom `dockerfile` can COPY them; usable<br/>with the built-in Dockerfile too, though it COPYs nothing extra). Default<br/>"" adds nothing. When set it replaces microvm/ as the context BASE, and<br/>the module overlays on top: wait-for-docker.sh, .artifacts/entrypoint,<br/>and the Dockerfile (built-in, or var.dockerfile when set) - a Dockerfile<br/>inside this directory is always overwritten, so the only Dockerfile<br/>override path is var.dockerfile. Prefer an absolute path (e.g.<br/>abspath("${path.root}/runner-context")): relative paths resolve against<br/>the directory terraform runs in. | `string` | `""` | no |
 | <a name="input_dispatcher_memory_size"></a> [dispatcher\_memory\_size](#input\_dispatcher\_memory\_size) | Dispatcher Lambda memory (MB). | `number` | `256` | no |
 | <a name="input_dispatcher_timeout"></a> [dispatcher\_timeout](#input\_dispatcher\_timeout) | Dispatcher Lambda timeout (seconds). | `number` | `300` | no |
+| <a name="input_docker_default"></a> [docker\_default](#input\_docker\_default) | Whether jobs get Docker (dockerd + the wait-for-docker job-started hook)<br/>when their runs-on labels do NOT include the extra "docker" label. A job<br/>that requests the "docker" label always gets it. true (default): every<br/>job gets Docker — the pre-v0.0.4 behavior. Migration to label opt-in:<br/>first add "docker" to the runs-on labels of the jobs that need it (e.g.<br/>[self-hosted, microvm, docker]), then set docker\_default = false so<br/>unlabeled jobs go lightweight — they skip dockerd startup (the<br/>page-in-heavy part of a cold boot) and never stall on the hook.<br/>-> DOCKER\_DEFAULT. | `bool` | `true` | no |
 | <a name="input_dockerfile"></a> [dockerfile](#input\_dockerfile) | Raw Dockerfile TEXT (not a path) that replaces the module's built-in<br/>microvm/Dockerfile as the image definition. Default "" keeps the built-in.<br/>Contract for a custom Dockerfile:<br/>  - Lambda builds it server-side ON TOP of the managed base image<br/>    (base\_image\_name/base\_image\_version -> base\_image\_arn). The built-in<br/>    Dockerfile pairs the default al2023-1 base with<br/>    `FROM public.ecr.aws/lambda/microvms:al2023-minimal`; FROM the<br/>    public.ecr.aws/lambda/microvms tag matching your base image.<br/>  - It MUST wire the in-guest supervisor, which the module stages into the<br/>    build context at .artifacts/entrypoint (validated below):<br/>        COPY .artifacts/entrypoint /entrypoint<br/>        RUN chmod 0755 /entrypoint<br/>        CMD ["/entrypoint"]<br/>  - arm64 only (Lambda MicroVMs are Graviton); the supervisor serves the<br/>    lifecycle hooks on the service-pinned port 9000 (see image.tf).<br/>Combine with build\_context\_dir for files the Dockerfile needs to COPY. | `string` | `""` | no |
 | <a name="input_egress_network_connector_arn"></a> [egress\_network\_connector\_arn](#input\_egress\_network\_connector\_arn) | Customer-managed Lambda network connector ARN for VPC egress (reach private resources: VPC endpoints, internal services, private cluster APIs). null = AWS-managed INTERNET\_EGRESS. | `string` | `null` | no |
 | <a name="input_event_pattern_label"></a> [event\_pattern\_label](#input\_event\_pattern\_label) | Single most-selective runner label used in the EventBridge rule pattern (array patterns are contains-ANY, so matching all required\_labels would over-trigger; the dispatcher re-checks the full subset). | `string` | `"microvm"` | no |

@@ -118,6 +118,11 @@ pub struct RunConfig {
     /// The dispatcher Lambda's function name, for idle reports. Absent when
     /// an old dispatcher built the payload — reporting is then skipped.
     pub dispatcher_fn: Option<String>,
+    /// Per-run docker capability, decided by the dispatcher ("docker" label
+    /// or `DOCKER_DEFAULT`). `None` when an old dispatcher built the payload
+    /// — resolution then falls back to the `ENABLE_DOCKER` env; see
+    /// [`Self::docker_enabled`].
+    pub enable_docker: Option<bool>,
 }
 
 impl RunConfig {
@@ -172,6 +177,12 @@ impl RunConfig {
                 .filter(|s| !s.is_empty()),
             runner_group: map.get("runner_group").cloned(),
             dispatcher_fn: field_str(&map, "dispatcher_fn"),
+            // JSON null counts as absent (falls back to ENABLE_DOCKER);
+            // any present non-null value is coerced loosely.
+            enable_docker: map
+                .get("enable_docker")
+                .filter(|v| !v.is_null())
+                .map(lenient::truthy),
         }
     }
 
@@ -188,6 +199,14 @@ impl RunConfig {
             .filter(|name| name.as_str().len() > RunnerName::PREFIX.len())
             .unwrap_or_else(RunnerName::random)
             .to_string()
+    }
+
+    /// Does THIS run get dockerd + the wait-for-docker job-started hook?
+    /// The payload's `enable_docker` when present (a new dispatcher decided
+    /// per job); otherwise the `ENABLE_DOCKER` env semantics carried by
+    /// `env_cfg` — old-dispatcher payloads behave exactly as before.
+    pub fn docker_enabled(&self, env_cfg: &crate::config::Config) -> bool {
+        self.enable_docker.unwrap_or(env_cfg.enable_docker)
     }
 
     /// Grace window for the pool idle wait: the payload value when usable,
@@ -328,6 +347,40 @@ mod tests {
                 .dispatcher_fn
                 .is_none()
         );
+    }
+
+    #[test]
+    fn enable_docker_reads_the_payload_and_null_or_absent_stays_none() {
+        assert_eq!(
+            RunConfig::from_value(json!({"enable_docker": true})).enable_docker,
+            Some(true)
+        );
+        assert_eq!(
+            RunConfig::from_value(json!({"enable_docker": false})).enable_docker,
+            Some(false)
+        );
+        // Old-dispatcher payloads: absent (or null) means "no decision".
+        assert!(RunConfig::from_value(json!({})).enable_docker.is_none());
+        assert!(
+            RunConfig::from_value(json!({"enable_docker": null}))
+                .enable_docker
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn docker_enabled_prefers_the_payload_and_falls_back_to_the_env_knob() {
+        use crate::state::testsupport::test_config;
+        let mut env = test_config("/opt/actions-runner");
+        // The payload decision wins over the env in BOTH polarities.
+        env.enable_docker = false;
+        assert!(RunConfig::from_value(json!({"enable_docker": true})).docker_enabled(&env));
+        env.enable_docker = true;
+        assert!(!RunConfig::from_value(json!({"enable_docker": false})).docker_enabled(&env));
+        // Absent field: exactly the ENABLE_DOCKER env semantics.
+        assert!(RunConfig::from_value(json!({})).docker_enabled(&env));
+        env.enable_docker = false;
+        assert!(!RunConfig::from_value(json!({})).docker_enabled(&env));
     }
 
     #[test]

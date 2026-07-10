@@ -123,7 +123,7 @@ rootfs. MicroVMs lift all three limits while keeping the serverless economics.
    │   MicrovmImage  gha-microvm-runner       ───── snapshot ────▶ │  entrypoint :9000         │
    │   (built from zip(Dockerfile+entrypoint) + al2023-minimal)     │   ├─ /run  → register     │
    │                                                                │   │   ephemeral runner    │
-   │   IAM: gha-microvm-exec-role (logs + TerminateMicrovm)         │   ├─ dockerd (per job)    │
+   │   IAM: gha-microvm-exec-role (logs + TerminateMicrovm)         │   ├─ dockerd (docker jobs)│
    │        gha-microvm-build-role (S3 + logs)                      │   ├─ runner runs 1 job    │
    │        gha-microvm-dispatcher-role (RunMicrovm/Pass*/secret)   │   └─ TerminateMicrovm self│
    │                                                                └───────────┬───────────────┘
@@ -186,7 +186,7 @@ Built **by Lambda** from a zip in S3 (not a normal `docker build` you push to EC
 - **python3** - stays in the image for workflow jobs that need it; the lifecycle-hook
   supervisor itself is a static binary with no interpreter dependency.
 
-`CMD ["/entrypoint"]`. Key env: `RUNNER_LABELS=self-hosted,linux,arm64,microvm`, `ENABLE_DOCKER=true`, `DOCKER_STORAGE_DRIVER=overlay2`.
+`CMD ["/entrypoint"]`. Key env: `RUNNER_LABELS=self-hosted,linux,arm64,microvm`, `ENABLE_DOCKER=true` (legacy fallback only — the dispatcher decides docker per job via the payload's `enable_docker`), `DOCKER_STORAGE_DRIVER=overlay2`. `ACTIONS_RUNNER_HOOK_JOB_STARTED` is deliberately **not** an image ENV: the supervisor injects it per-run, only for docker-enabled jobs.
 
 ### 4.2 The entrypoint supervisor (`crates/entrypoint`)
 
@@ -219,13 +219,23 @@ idleness to the dispatcher (when the `/run` payload named it via
 the VM's **own** `microvmId` (delivered in the `/run` body) - see
 [cost / self-terminate](#53-cost-model--self-termination).
 
-`dockerd` is started **fresh per job** (not baked into the snapshot) - see
-[Docker + DNS](#52-docker-in-runner--the-dns-fix). `start_runner()` warms it up in a
-**background thread** so it overlaps runner registration + the GitHub job-assignment
-handshake instead of blocking before them. A docker step still can't race the
-daemon: the runner's **job-started hook** (`ACTIONS_RUNNER_HOOK_JOB_STARTED` ->
-`wait-for-docker.sh`) runs after the job is assigned but before its first step, and
-blocks until `docker info` succeeds (best-effort, capped by `DOCKER_WAIT_TIMEOUT`).
+`dockerd` is started **fresh per docker-enabled job** (never baked into the
+snapshot) - see [Docker + DNS](#52-docker-in-runner--the-dns-fix). **Docker is a
+per-job capability** (v0.0.4): the `/run` payload's `enable_docker` field carries
+the dispatcher's decision (`docker` runs-on label, or `DOCKER_DEFAULT` for
+unlabeled jobs); payloads from older dispatchers lack the field and fall back to
+the image's `ENABLE_DOCKER` env. A non-docker run neither starts dockerd (the
+page-in-heavy part of a cold boot) nor gets the job-started hook. For
+docker-enabled runs, the run task warms dockerd up in a **background thread** so
+it overlaps runner registration + the GitHub job-assignment handshake instead of
+blocking before them. A docker step still can't race the daemon: the supervisor
+injects the runner's **job-started hook** (`ACTIONS_RUNNER_HOOK_JOB_STARTED` ->
+`wait-for-docker.sh`) into the runner process env — per-run, only when docker is
+enabled; it is no longer an image-wide ENV — and the hook runs after the job is
+assigned but before its first step, blocking until `docker info` succeeds
+(best-effort, capped by `DOCKER_WAIT_TIMEOUT`). Warm-pool transitions hold in
+both directions: the between-jobs cleanup tears dockerd down, and the next
+handoff payload decides afresh whether it comes back.
 
 ### 4.3 The dispatcher (`crates/dispatcher`)
 
@@ -249,10 +259,15 @@ rejecting anything else (401). For each event it:
    private key (`iss` = numeric App ID as a *string*; `exp` < 10 min),
    exchange it for a repo-scoped **installation access token** (~1 h, cached 60 s
    per container), which can register runners.
-4. **Launches the MicroVM** - `RunMicrovm(imageIdentifier, imageVersion,
+4. **Decides docker** - `enable_docker = job labels contain "docker" OR
+   DOCKER_DEFAULT` rides in the payload, and the registration `labels` become
+   the **union** of `RUNNER_LABELS` and the job's requested labels (order kept,
+   deduped) so a `docker`-labeled job can be assigned to the runner it
+   triggered.
+5. **Launches the MicroVM** - `RunMicrovm(imageIdentifier, imageVersion,
    executionRoleArn, egressNetworkConnectors=[INTERNET_EGRESS],
    maximumDurationInSeconds, runHookPayload={github_url, token, ephemeral:true,
-   labels})`. Retries a transient `AccessDeniedException` (IAM PassRole propagation).
+   labels, enable_docker})`. Retries a transient `AccessDeniedException` (IAM PassRole propagation).
 
 It never logs the private key or any token. Secret reads are cached 60 s so config
 changes propagate to warm containers without a redeploy.
@@ -325,9 +340,9 @@ Three non-obvious problems, all solved in the entrypoint supervisor (`crates/ent
 
 1. **Stale daemon networking.** If `dockerd` were started at boot it would be in the
    snapshot, and on resume its bridge/NAT/DNS would be stale → nested containers
-   can't reach anything. **Fix:** start `dockerd` **fresh per job** in
-   `start_runner()` (not at `/ready`, not in the snapshot), trying `overlay2` then
-   falling back to `vfs`.
+   can't reach anything. **Fix:** start `dockerd` **fresh per docker-enabled job**
+   in the run task (not at `/ready`, not in the snapshot — and not at all for
+   non-docker jobs), trying `overlay2` then falling back to `vfs`.
 2. **DNS resolution fails inside containers.** MicroVMs **block outbound UDP to
    public resolvers** and ship a local DNS *stub* that container/build network
    namespaces can't reach. Docker's default fallback to `8.8.8.8` therefore fails

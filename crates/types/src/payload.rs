@@ -59,6 +59,13 @@ pub struct RunPayload {
     /// payloads built by older dispatchers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatcher_fn: Option<String>,
+    /// Whether this run gets dockerd + the wait-for-docker job-started hook.
+    /// The dispatcher decides per job (`"docker"` label or `DOCKER_DEFAULT`).
+    /// Absent from payloads built by older dispatchers — the entrypoint then
+    /// falls back to its `ENABLE_DOCKER` env, exactly the pre-v0.0.4
+    /// behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_docker: Option<bool>,
     /// Forward-compatibility: fields this version doesn't know survive a
     /// round-trip (a newer dispatcher can hand off to an older entrypoint).
     #[serde(flatten)]
@@ -84,6 +91,7 @@ impl RunPayload {
             microvm_id: None,
             runner_group: None,
             dispatcher_fn: None,
+            enable_docker: None,
             extra: BTreeMap::new(),
         }
     }
@@ -129,6 +137,7 @@ impl fmt::Debug for RunPayload {
             .field("microvm_id", &self.microvm_id)
             .field("runner_group", &self.runner_group)
             .field("dispatcher_fn", &self.dispatcher_fn)
+            .field("enable_docker", &self.enable_docker)
             .field("extra", &self.extra)
             .finish()
     }
@@ -213,6 +222,43 @@ mod tests {
         assert!(p.dispatcher_fn.is_none());
         let back = serde_json::to_value(&p).unwrap();
         assert!(!back.as_object().unwrap().contains_key("dispatcher_fn"));
+    }
+
+    #[test]
+    fn enable_docker_roundtrips_both_polarities() {
+        for enabled in [true, false] {
+            let wire = serde_json::json!({
+                "github_url": "https://github.com/o/r",
+                "token": "t",
+                "enable_docker": enabled,
+            });
+            let p: RunPayload = serde_json::from_value(wire).unwrap();
+            assert_eq!(p.enable_docker, Some(enabled));
+            let back = serde_json::to_value(&p).unwrap();
+            assert_eq!(back["enable_docker"], enabled);
+            // A typed field, not a flattened `extra` leftover: exactly one key.
+            assert_eq!(
+                back.as_object()
+                    .unwrap()
+                    .keys()
+                    .filter(|k| *k == "enable_docker")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn absent_enable_docker_stays_absent_both_directions() {
+        // Backward compatibility: an old dispatcher's payload (no field)
+        // parses to None, and None never serializes the key — so an old
+        // entrypoint reading a new payload without the field sees exactly
+        // the pre-v0.0.4 wire shape.
+        let p: RunPayload =
+            serde_json::from_value(serde_json::json!({"github_url": "u", "token": "t"})).unwrap();
+        assert!(p.enable_docker.is_none());
+        let back = serde_json::to_value(&p).unwrap();
+        assert!(!back.as_object().unwrap().contains_key("enable_docker"));
     }
 
     #[test]

@@ -33,6 +33,10 @@ pub struct Config {
     pub required_labels: BTreeSet<String>,
     /// Ordered; joined into the payload's comma-separated `labels`.
     pub runner_labels: Vec<String>,
+    /// Docker capability for jobs whose labels do NOT include `docker`
+    /// (labeled jobs always get it). `true` (the default) keeps the
+    /// everything-gets-dockerd behavior; `false` makes docker label-opt-in.
+    pub docker_default: bool,
     /// 0 == unlimited.
     pub max_concurrency: i64,
     pub pool_enabled: bool,
@@ -75,12 +79,7 @@ impl Config {
                 .map(str::to_string)
                 .collect()
         };
-        let flag = |k: &str| -> bool {
-            matches!(
-                get(k).unwrap_or_default().to_lowercase().as_str(),
-                "1" | "true" | "yes"
-            )
-        };
+        let flag = |k: &str| -> bool { flag_value(&get(k).unwrap_or_default()) };
 
         Ok(Self {
             region: required("AWS_REGION")?,
@@ -100,6 +99,9 @@ impl Config {
                 .into_iter()
                 .collect(),
             runner_labels: labels("RUNNER_LABELS", "self-hosted,linux,arm64,microvm"),
+            // Unset means true (every job gets docker — the pre-v0.0.4
+            // behavior); any non-truthy value means label-opt-in only.
+            docker_default: get("DOCKER_DEFAULT").is_none_or(|v| flag_value(&v)),
             max_concurrency: int("MAX_CONCURRENCY", 0)?,
             pool_enabled: flag("POOL_ENABLED"),
             handoff_window: int("HANDOFF_WINDOW_SECONDS", 90)?,
@@ -120,6 +122,11 @@ impl Config {
     pub fn eol_threshold(&self) -> f64 {
         ((self.max_duration - 900) as f64).max(self.max_duration as f64 * 0.5)
     }
+}
+
+/// The truthy flag spellings: `1`/`true`/`yes`, case-insensitive.
+fn flag_value(v: &str) -> bool {
+    matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes")
 }
 
 #[cfg(test)]
@@ -179,6 +186,19 @@ mod tests {
             c.runner_labels,
             vec!["self-hosted", "linux", "arm64", "microvm"]
         );
+        assert!(c.docker_default, "unset DOCKER_DEFAULT means true");
+    }
+
+    #[test]
+    fn docker_default_defaults_true_and_false_opts_into_labels() {
+        // Unlike POOL_ENABLED (absent == false), DOCKER_DEFAULT preserves
+        // the pre-v0.0.4 behavior when unset: every job gets docker.
+        for v in ["true", "TRUE", "1", "yes"] {
+            assert!(cfg_with(&[("DOCKER_DEFAULT", v)]).docker_default, "{v}");
+        }
+        for v in ["false", "0", "no", ""] {
+            assert!(!cfg_with(&[("DOCKER_DEFAULT", v)]).docker_default, "{v:?}");
+        }
     }
 
     #[test]

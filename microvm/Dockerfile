@@ -144,9 +144,14 @@ RUN chmod 0755 /entrypoint
 
 # Runner job-started hook: gates the job's first step until dockerd is ready, so a
 # docker step never races the daemon the entrypoint warms up in the background.
+# NOT wired via an image-wide ACTIONS_RUNNER_HOOK_JOB_STARTED ENV: the supervisor
+# injects that env into the runner per-run, only for docker-enabled jobs, so
+# non-docker jobs never stall on this gate.
 COPY wait-for-docker.sh /opt/actions-runner-hooks/wait-for-docker.sh
 RUN chmod 0755 /opt/actions-runner-hooks/wait-for-docker.sh
 
+# ENABLE_DOCKER is only the legacy fallback for payloads built by pre-v0.0.4
+# dispatchers (no enable_docker field); new dispatchers decide per job.
 ENV RUNNER_ALLOW_RUNASROOT=1 \
     HOME=/root \
     HOOK_PORT=9000 \
@@ -154,7 +159,6 @@ ENV RUNNER_ALLOW_RUNASROOT=1 \
     RUNNER_LABELS=self-hosted,linux,arm64,microvm \
     ENABLE_DOCKER=true \
     DOCKER_STORAGE_DRIVER=overlay2 \
-    ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/actions-runner-hooks/wait-for-docker.sh \
     DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
     RUNNER_VERSION=${RUNNER_VERSION}

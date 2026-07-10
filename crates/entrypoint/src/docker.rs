@@ -2,6 +2,24 @@
 //! the snapshot, whose bridge/NAT/DNS would be stale on a resumed host),
 //! with the link-local Amazon resolver pinned and `--default-ulimit`
 //! matching our achieved nofile limits.
+//!
+//! Snapshot-restore hazards and where each is handled (so the next reader
+//! doesn't re-derive this):
+//! - STALE FILES: pid/socket remnants from a pre-snapshot or crashed
+//!   dockerd/containerd (a leftover docker.pid aborts dockerd at startup; a
+//!   stale docker.sock makes client probes hang instead of failing fast).
+//!   Handled by [`remove_stale_runtime_files`] on the pre-start path of
+//!   EVERY launch attempt in [`DockerSupervisor::start_pass`], and again in
+//!   [`kill_stale_runtimes`] between passes.
+//! - WEDGED DAEMON: dockerd alive but never answering. Every `docker info`
+//!   probe is bounded ([`PROBE_TIMEOUT`], clamped by [`probe_budget`]) and
+//!   each storage driver gets a wall-clock [`READY_WINDOW`], after which the
+//!   child is SIGTERMed/killed and the next driver/pass retries — no wait in
+//!   the startup path is unbounded.
+//! - XTABLES LOCK: nothing in this crate or the image invokes iptables
+//!   directly (microvm/Dockerfile only installs the package for dockerd), so
+//!   no `-w <seconds>` flag is needed here; dockerd's own iptables calls
+//!   handle the lock internally.
 
 use crate::config::{Config, env_or};
 use crate::logfmt::log;
@@ -16,6 +34,35 @@ use tokio::process::Command;
 
 const DOCKERD_LOG: &str = "/tmp/dockerd.log";
 
+/// Bound on a single `docker info` readiness probe (wedged-daemon hazard):
+/// against a stale socket or a hung daemon the client has no timeout of its
+/// own and blocks forever, which would stall the whole pass.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pause between readiness probes.
+const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Wall-clock readiness window per storage driver within a pass. After this
+/// the child is SIGTERMed/killed and the next driver (or pass) retries.
+/// Wall clock, not an iteration count, so slow probes can't stretch it.
+const READY_WINDOW: Duration = Duration::from_secs(30);
+
+/// Runtime files a crashed, killed, or pre-snapshot dockerd + containerd
+/// leave behind (stale-files hazard): dockerd refuses to start over an
+/// existing docker.pid, and a stale unix socket makes `docker info` hang
+/// rather than fail fast. /var/run is a symlink to /run on AL2023, but both
+/// spellings are listed so the cleanup holds if that ever changes.
+const STALE_RUNTIME_FILES: &[&str] = &[
+    "/var/run/docker.pid",
+    "/run/docker.pid",
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/var/run/docker/containerd/containerd.pid",
+    "/var/run/docker/containerd/containerd.sock",
+    "/run/containerd/containerd.pid",
+    "/run/containerd/containerd.sock",
+];
+
 /// Owns the dockerd child and readiness flag; clone freely (shared state).
 #[derive(Clone)]
 pub struct DockerSupervisor {
@@ -23,7 +70,6 @@ pub struct DockerSupervisor {
 }
 
 struct DockerInner {
-    enabled: bool,
     storage_driver: String,
     nofile_soft: u64,
     nofile_hard: u64,
@@ -40,7 +86,6 @@ impl DockerSupervisor {
     pub fn new(cfg: &Config) -> Self {
         Self {
             inner: Arc::new(DockerInner {
-                enabled: cfg.enable_docker,
                 storage_driver: cfg.docker_storage_driver.clone(),
                 nofile_soft: cfg.nofile_soft,
                 nofile_hard: cfg.nofile_hard,
@@ -49,17 +94,17 @@ impl DockerSupervisor {
         }
     }
 
-    /// Bring docker up for the upcoming job. Spawned in the background off
-    /// the run task so it overlaps registration; the job's first step still
-    /// can't race the daemon thanks to the wait-for-docker job-started
-    /// hook. Retries a few times: on a freshly-resumed MicroVM dockerd can
-    /// crash if its bridge/iptables setup runs before the network settles.
+    /// Bring docker up for the upcoming job. Called ONLY for docker-enabled
+    /// runs (the run task resolves the per-run payload decision, with the
+    /// `ENABLE_DOCKER` env as the legacy fallback). Spawned in the
+    /// background off the run task so it overlaps registration; the job's
+    /// first step still can't race the daemon thanks to the wait-for-docker
+    /// job-started hook. Retries a few times: on a freshly-resumed MicroVM
+    /// dockerd can crash if its bridge/iptables setup runs before the
+    /// network settles.
     pub async fn ensure(self) {
-        if !self.inner.enabled {
-            return;
-        }
         let mut state = self.inner.state.lock().await;
-        if docker_info_ok().await {
+        if docker_info_ok(PROBE_TIMEOUT).await {
             state.ready = true;
             return;
         }
@@ -116,6 +161,14 @@ impl DockerSupervisor {
                 }
             };
             log(format!("starting dockerd (storage-driver={driver})"));
+            // Stale-files hazard: clean pid/socket remnants before EVERY
+            // launch attempt — including the first attempt of the first
+            // pass, which otherwise starts over whatever the snapshot (or a
+            // just-killed sibling attempt) left behind. Process reaping for
+            // earlier attempts is kill_stale_runtimes() between passes;
+            // within a pass the previous child is already dead or killed
+            // below before we get back here.
+            remove_stale_runtime_files();
             let spawned = Command::new("dockerd")
                 .arg("--host=unix:///var/run/docker.sock")
                 .arg(format!("--storage-driver={driver}"))
@@ -138,9 +191,18 @@ impl DockerSupervisor {
                     continue;
                 }
             };
+            // Wedged-daemon hazard: the readiness wait is bounded by WALL
+            // CLOCK (READY_WINDOW), with every probe clamped to the window's
+            // remainder — so a dockerd that is alive but never answers gets
+            // SIGTERM/kill + retry below instead of an unbounded wait.
+            let deadline = tokio::time::Instant::now() + READY_WINDOW;
             let mut child_exited = false;
-            for _ in 0..30 {
-                if docker_info_ok().await {
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                if docker_info_ok(probe_budget(remaining)).await {
                     state.ready = true;
                     log(format!("dockerd ready (storage-driver={driver})"));
                     state.child = Some(child);
@@ -155,7 +217,7 @@ impl DockerSupervisor {
                     child_exited = true;
                     break;
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(PROBE_INTERVAL.min(remaining)).await;
             }
             if !child_exited {
                 // Alive but never became ready: terminate, then kill if
@@ -200,16 +262,34 @@ impl DockerSupervisor {
     }
 }
 
-/// `docker info` succeeding is THE readiness probe.
-async fn docker_info_ok() -> bool {
-    Command::new("docker")
-        .arg("info")
+/// `docker info` succeeding is THE readiness probe. Bounded (wedged-daemon
+/// hazard): a hung probe counts as not-ready, and `kill_on_drop` ensures the
+/// timed-out `docker info` process does not linger.
+async fn docker_info_ok(bound: Duration) -> bool {
+    let mut cmd = Command::new("docker");
+    cmd.arg("info")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .kill_on_drop(true);
+    match tokio::time::timeout(bound, cmd.status()).await {
+        Ok(Ok(status)) => status.success(),
+        _ => false,
+    }
+}
+
+/// Budget for the next readiness probe: the standard [`PROBE_TIMEOUT`],
+/// clamped to the pass window's remainder so a pass never overruns
+/// [`READY_WINDOW`] even when its last probe hangs.
+fn probe_budget(remaining: Duration) -> Duration {
+    PROBE_TIMEOUT.min(remaining)
+}
+
+/// Remove stale pid/socket files (stale-files hazard; see
+/// [`STALE_RUNTIME_FILES`]). Best-effort: missing files are fine.
+fn remove_stale_runtime_files() {
+    for path in STALE_RUNTIME_FILES {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Dump the tail of dockerd's log to CloudWatch, so a startup crash is
@@ -255,7 +335,9 @@ async fn ensure_cgroup2() {
 }
 
 /// dockerd teardown leaves its managed containerd orphaned; reap both and
-/// clear their sockets for a clean pass.
+/// clear their pid/socket files for a clean pass. (start_pass also removes
+/// the files before every launch, so even the first pass — where this reaper
+/// has not run yet — starts clean; see STALE_RUNTIME_FILES.)
 pub async fn kill_stale_runtimes() -> Result<(), String> {
     for name in ["dockerd", "containerd"] {
         Command::new("pkill")
@@ -265,13 +347,7 @@ pub async fn kill_stale_runtimes() -> Result<(), String> {
             .map_err(|e| format!("pkill {name}: {e}"))?;
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
-    for sock in [
-        "/var/run/docker.sock",
-        "/var/run/docker/containerd/containerd.sock",
-        "/run/containerd/containerd.sock",
-    ] {
-        let _ = std::fs::remove_file(sock);
-    }
+    remove_stale_runtime_files();
     Ok(())
 }
 
@@ -294,5 +370,60 @@ async fn log_runtime_diag() {
             Ok(Err(e)) => log(format!("  diag[{label}]| ({e})")),
             Err(_) => log(format!("  diag[{label}]| (timed out after 5s)")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stale-files hazard list must cover dockerd's pid + socket under
+    /// BOTH the /run and /var/run spellings (symlinked on AL2023, but the
+    /// cleanup must not depend on that), and containerd's pid + socket for
+    /// both the dockerd-managed and standalone paths.
+    #[test]
+    fn stale_file_list_covers_pid_and_socket_variants() {
+        for path in [
+            "/var/run/docker.pid",
+            "/run/docker.pid",
+            "/var/run/docker.sock",
+            "/run/docker.sock",
+            "/var/run/docker/containerd/containerd.pid",
+            "/var/run/docker/containerd/containerd.sock",
+            "/run/containerd/containerd.pid",
+            "/run/containerd/containerd.sock",
+        ] {
+            assert!(
+                STALE_RUNTIME_FILES.contains(&path),
+                "stale-file list is missing {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_budget_caps_at_probe_timeout() {
+        assert_eq!(probe_budget(Duration::from_secs(3600)), PROBE_TIMEOUT);
+        assert_eq!(probe_budget(READY_WINDOW), PROBE_TIMEOUT);
+    }
+
+    #[test]
+    fn probe_budget_never_exceeds_remaining_window() {
+        // The clamp is what bounds a pass at READY_WINDOW even when its
+        // final probe hangs: the probe gets only the window's remainder.
+        assert_eq!(probe_budget(Duration::from_secs(2)), Duration::from_secs(2));
+        assert_eq!(probe_budget(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// Worst-case pass arithmetic: with probes clamped to the remainder, one
+    /// driver's readiness wait can never exceed its wall-clock window, so a
+    /// full pass (configured driver + vfs fallback, 5 s term grace each) is
+    /// bounded regardless of how probes behave.
+    #[test]
+    fn pass_wait_is_bounded_by_ready_window_per_driver() {
+        assert!(probe_budget(READY_WINDOW) <= READY_WINDOW);
+        assert!(PROBE_INTERVAL <= READY_WINDOW);
+        let term_grace = Duration::from_secs(5); // SIGTERM wait in start_pass
+        let worst_case_pass = (READY_WINDOW + term_grace) * 2;
+        assert!(worst_case_pass < Duration::from_secs(90));
     }
 }

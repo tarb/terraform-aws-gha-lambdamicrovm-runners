@@ -260,6 +260,7 @@ impl Sweeper {
                     repo: repo.to_string(),
                     job_id: job.id,
                     installation,
+                    labels: job.labels.clone(),
                 };
                 match self.dispatcher.dispatch(&job_ref).await {
                     Ok(()) => *dispatched += 1,
