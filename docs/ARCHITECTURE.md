@@ -362,13 +362,14 @@ every VM would share one runner identity / one RNG state. So:
 
 ### 5.2 Docker-in-runner & the DNS fix
 
-Three non-obvious problems, all solved in the entrypoint supervisor (`crates/entrypoint`):
+Four non-obvious problems, all solved in the entrypoint supervisor (`crates/entrypoint`):
 
 1. **Stale daemon networking.** If `dockerd` were started at boot it would be in the
    snapshot, and on resume its bridge/NAT/DNS would be stale → nested containers
    can't reach anything. **Fix:** start `dockerd` **fresh per docker-enabled job**
    in the run task (not at `/ready`, not in the snapshot — and not at all for
-   non-docker jobs), trying `overlay2` then falling back to `vfs`.
+   non-docker jobs), `overlay2` only — see problem 4 for why there is
+   deliberately no `vfs` fallback.
 2. **DNS resolution fails inside containers.** MicroVMs **block outbound UDP to
    public resolvers** and ship a local DNS *stub* that container/build network
    namespaces can't reach. Docker's default fallback to `8.8.8.8` therefore fails
@@ -386,6 +387,19 @@ Three non-obvious problems, all solved in the entrypoint supervisor (`crates/ent
    raise the hard limit up to `fs.nr_open`), and passes
    `--default-ulimit nofile=...` (clamped to the achieved hard limit) so plain
    containers get an explicit sane default too.
+4. **A fixed 32GB disk shared with a persistent data-root.** The microvm API has
+   no storage knob (`Resources` is `minimum_memory_in_mib` only), everything
+   lives on one 32GB root filesystem, and `/var/lib/docker` survives pool
+   suspend/resume with no GC — so reused pool VMs accumulate build cache until
+   some bake dies `no space left on device`. Worse, the old `overlay2 → vfs`
+   driver fallback meant a corrupt data-root silently degraded to `vfs`, whose
+   full-copy layers (no CoW) turn one monorepo bake into 12GB+ and poison the
+   data-root with mixed-driver metadata. **Fix:** the fallback is gone (a
+   repeatedly-failing dockerd gets a data-root **wipe + overlay2 retry**
+   instead), and before each job's dockerd starts the supervisor wipes the
+   data-root if free space is under **`DOCKER_MIN_FREE_GB`** (default 16, set
+   via `runner_environment_variables`) — registry `cache-from` covers the lost
+   warm layers.
 
 > **Gotcha for workloads:** `docker/build-push-action` spins up its own
 > *buildx-container* builder (a separate network namespace), which re-introduces

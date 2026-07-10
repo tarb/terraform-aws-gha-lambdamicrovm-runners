@@ -16,10 +16,23 @@
 //!   each storage driver gets a wall-clock [`READY_WINDOW`], after which the
 //!   child is SIGTERMed/killed and the next driver/pass retries — no wait in
 //!   the startup path is unbounded.
-//! - XTABLES LOCK: nothing in this crate or the image invokes iptables
-//!   directly (microvm/Dockerfile only installs the package for dockerd), so
-//!   no `-w <seconds>` flag is needed here; dockerd's own iptables calls
-//!   handle the lock internally.
+//! - XTABLES LOCK: nothing in this crate invokes iptables directly (the
+//!   ipv6 fast-fail in ipv6.rs shells out to ip6tables WITH `-w`, and the
+//!   image installs the package for dockerd), so no `-w <seconds>` flag is
+//!   needed here; dockerd's own iptables calls handle the lock internally.
+//! - DISK POISON: /var/lib/docker persists across pool suspend/resume, on a
+//!   FIXED 32GB root disk (the microvm API has no storage knob — Resources
+//!   is minimum_memory_in_mib only). Two rules follow. (1) NEVER fall back
+//!   to the vfs storage driver: vfs full-copies every layer (no CoW), so
+//!   one monorepo bake fills the disk (observed: 12GB of /var/lib/docker/vfs
+//!   and an ENOSPC'd bake), and mixing drivers in one data-root corrupts
+//!   metadata for every later job on that pooled VM. When overlay2 won't
+//!   start, the fix is wiping the data-root and retrying overlay2 — handled
+//!   between start attempts in [`DockerSupervisor::ensure`]. (2) Reused
+//!   pool VMs accumulate build cache with no GC; [`reclaim_disk_if_low`]
+//!   wipes the data-root before a job's dockerd starts when free space is
+//!   under `DOCKER_MIN_FREE_GB` (default 16) — registry cache-from covers
+//!   the lost warm layers, ENOSPC mid-bake does not.
 
 use crate::config::{Config, env_or};
 use crate::logfmt::log;
@@ -33,6 +46,17 @@ use std::time::Duration;
 use tokio::process::Command;
 
 const DOCKERD_LOG: &str = "/tmp/dockerd.log";
+
+/// dockerd's data-root (we never pass `--data-root`, so the default). Lives
+/// on the same fixed 32GB root filesystem as everything else and persists
+/// across pool suspend/resume — see the DISK POISON hazard above.
+const DOCKER_DATA_ROOT: &str = "/var/lib/docker";
+
+/// Default free-space floor (GiB) under which the data-root is wiped before
+/// a job's dockerd starts. Override with the `DOCKER_MIN_FREE_GB` env (via
+/// `runner_environment_variables`). 16 leaves a full-width monorepo bake
+/// (~6 parallel cargo-chef targets) headroom on the 32GB disk.
+const DEFAULT_MIN_FREE_GB: u64 = 16;
 
 /// Bound on a single `docker info` readiness probe (wedged-daemon hazard):
 /// against a stale socket or a hung daemon the client has no timeout of its
@@ -110,9 +134,14 @@ impl DockerSupervisor {
         }
         log("starting dockerd for this job");
         ensure_cgroup2().await;
+        // No daemon is running here (the early probe above returned false),
+        // so wiping is safe. Pool-reuse accumulation is caught before it
+        // becomes a mid-bake ENOSPC.
+        reclaim_disk_if_low(DOCKER_DATA_ROOT);
         // Read lazily so operators can tune without a rebuild; unparsable
         // falls back to 4.
         let attempts: u32 = env_or("DOCKERD_START_ATTEMPTS", "4").parse().unwrap_or(4);
+        let mut wiped_for_recovery = false;
         for attempt in 1..=attempts {
             if self.start_pass(&mut state).await {
                 return;
@@ -124,6 +153,17 @@ impl DockerSupervisor {
                 if let Err(e) = kill_stale_runtimes().await {
                     log(format!("reaping stale runtimes failed: {e}"));
                 }
+                // Two failures usually mean corrupt data-root state (e.g. a
+                // snapshot taken mid-write), not the network-settle crash the
+                // plain retries cover. Wipe once and let overlay2 try fresh —
+                // NEVER degrade to vfs (DISK POISON hazard above).
+                if attempt >= 2 && !wiped_for_recovery {
+                    log(
+                        "dockerd failed repeatedly; wiping docker data-root (corrupt-state recovery)",
+                    );
+                    wipe_dir_children(std::path::Path::new(DOCKER_DATA_ROOT));
+                    wiped_for_recovery = true;
+                }
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
@@ -131,8 +171,13 @@ impl DockerSupervisor {
         log_runtime_diag().await;
     }
 
-    /// One pass over the storage drivers (configured driver, then vfs).
-    /// Returns true when dockerd became ready.
+    /// One start attempt with the configured storage driver. Returns true
+    /// when dockerd became ready. There is deliberately NO driver fallback:
+    /// v0.0.7-era code fell back to vfs when overlay2 failed on a resumed
+    /// VM, and vfs's full-copy layers filled the fixed 32GB disk in one
+    /// bake while poisoning the shared data-root with mixed-driver
+    /// metadata (see the DISK POISON hazard in the module docs). Recovery
+    /// from a corrupt data-root is the wipe-and-retry in [`Self::ensure`].
     async fn start_pass(&self, state: &mut DockerState) -> bool {
         if let Err(e) = std::fs::create_dir_all("/var/run") {
             log(format!("could not create /var/run: {e}"));
@@ -148,11 +193,8 @@ impl DockerSupervisor {
                 return false;
             }
         };
-        let mut drivers = vec![self.inner.storage_driver.clone()];
-        if self.inner.storage_driver != "vfs" {
-            drivers.push("vfs".to_string());
-        }
-        for driver in &drivers {
+        {
+            let driver = &self.inner.storage_driver;
             let (out, err) = match (logf.try_clone(), logf.try_clone()) {
                 (Ok(a), Ok(b)) => (a, b),
                 _ => {
@@ -188,7 +230,7 @@ impl DockerSupervisor {
                     log(format!(
                         "dockerd spawn failed (storage-driver={driver}): {e}"
                     ));
-                    continue;
+                    return false;
                 }
             };
             // Wedged-daemon hazard: the readiness wait is bounded by WALL
@@ -210,7 +252,7 @@ impl DockerSupervisor {
                 }
                 if let Ok(Some(status)) = child.try_wait() {
                     log(format!(
-                        "dockerd exited (storage-driver={driver}, rc={}); trying next",
+                        "dockerd exited (storage-driver={driver}, rc={})",
                         exit_code(status)
                     ));
                     log_dockerd_tail(25); // surface WHY it crashed
@@ -289,6 +331,92 @@ fn probe_budget(remaining: Duration) -> Duration {
 fn remove_stale_runtime_files() {
     for path in STALE_RUNTIME_FILES {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Wipe the docker data-root before this job's dockerd starts when the
+/// filesystem is under the free-space floor (`DOCKER_MIN_FREE_GB`, default
+/// [`DEFAULT_MIN_FREE_GB`]). Pool VMs reuse the data-root across jobs with
+/// no GC, so accumulation otherwise surfaces as ENOSPC in the middle of
+/// whichever bake draws the dirty VM. A wipe costs one cold layer pull
+/// (registry cache-from covers rebuild speed); an ENOSPC costs the job.
+/// Must only be called while no dockerd is running.
+fn reclaim_disk_if_low(root: &str) {
+    let min_free = min_free_bytes(&env_or("DOCKER_MIN_FREE_GB", ""));
+    let Some(avail) = available_bytes(root) else {
+        return; // statvfs failed (already logged); don't guess
+    };
+    if avail >= min_free {
+        return;
+    }
+    log(format!(
+        "docker data-root low on space ({} free < {} floor) - wiping {root} for a clean slate",
+        fmt_gib(avail),
+        fmt_gib(min_free)
+    ));
+    wipe_dir_children(std::path::Path::new(root));
+    if let Some(after) = available_bytes(root) {
+        log(format!(
+            "docker data-root wiped ({} free now)",
+            fmt_gib(after)
+        ));
+    }
+}
+
+/// The free-space floor in bytes: `raw` (the `DOCKER_MIN_FREE_GB` env) as
+/// whole GiB, falling back to [`DEFAULT_MIN_FREE_GB`] when unset/garbage.
+fn min_free_bytes(raw: &str) -> u64 {
+    let gb: u64 = raw.parse().unwrap_or(DEFAULT_MIN_FREE_GB);
+    gb.saturating_mul(1024 * 1024 * 1024)
+}
+
+/// Available bytes (unprivileged view, f_bavail) on the filesystem holding
+/// `path`. None (with a log line) when statvfs fails — e.g. the path does
+/// not exist yet on a pristine image.
+fn available_bytes(path: &str) -> Option<u64> {
+    match nix::sys::statvfs::statvfs(path) {
+        Ok(s) => {
+            let avail = u128::from(s.blocks_available()) * u128::from(s.fragment_size());
+            Some(u64::try_from(avail).unwrap_or(u64::MAX))
+        }
+        Err(e) => {
+            log(format!("statvfs {path} failed: {e}"));
+            None
+        }
+    }
+}
+
+/// `bytes` as a one-decimal GiB label for log lines.
+fn fmt_gib(bytes: u64) -> String {
+    format!("{:.1}GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+/// Remove everything INSIDE `root`, keeping `root` itself (it can be a
+/// mount point, and dockerd recreates the layout it needs). Best-effort:
+/// each failure is logged and the rest proceeds — a partial wipe still
+/// frees space.
+fn wipe_dir_children(root: &std::path::Path) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            log(format!("WARN: could not list {}: {e}", root.display()));
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // DirEntry::file_type does not follow symlinks, so a symlinked dir
+        // is removed as a file (the link), never traversed.
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let removed = if is_dir {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(e) = removed {
+            log(format!("WARN: could not remove {}: {e}", path.display()));
+        }
     }
 }
 
@@ -414,16 +542,55 @@ mod tests {
         assert_eq!(probe_budget(Duration::ZERO), Duration::ZERO);
     }
 
-    /// Worst-case pass arithmetic: with probes clamped to the remainder, one
-    /// driver's readiness wait can never exceed its wall-clock window, so a
-    /// full pass (configured driver + vfs fallback, 5 s term grace each) is
-    /// bounded regardless of how probes behave.
+    /// Worst-case pass arithmetic: with probes clamped to the remainder, the
+    /// single driver's readiness wait can never exceed its wall-clock window
+    /// (plus SIGTERM grace), regardless of how probes behave. There is no
+    /// vfs fallback to double it — see the DISK POISON hazard.
     #[test]
-    fn pass_wait_is_bounded_by_ready_window_per_driver() {
+    fn pass_wait_is_bounded_by_ready_window() {
         assert!(probe_budget(READY_WINDOW) <= READY_WINDOW);
         assert!(PROBE_INTERVAL <= READY_WINDOW);
         let term_grace = Duration::from_secs(5); // SIGTERM wait in start_pass
-        let worst_case_pass = (READY_WINDOW + term_grace) * 2;
-        assert!(worst_case_pass < Duration::from_secs(90));
+        let worst_case_pass = READY_WINDOW + term_grace;
+        assert!(worst_case_pass < Duration::from_secs(45));
+    }
+
+    #[test]
+    fn min_free_bytes_parses_whole_gib_and_defaults_on_garbage() {
+        assert_eq!(min_free_bytes("2"), 2 * 1024 * 1024 * 1024);
+        assert_eq!(min_free_bytes("0"), 0); // explicit opt-out stays 0
+        let default = DEFAULT_MIN_FREE_GB * 1024 * 1024 * 1024;
+        for garbage in ["", "16GB", "-1", "lots"] {
+            assert_eq!(min_free_bytes(garbage), default, "input {garbage:?}");
+        }
+    }
+
+    #[test]
+    fn available_bytes_reports_a_real_filesystem() {
+        // Any existing path works; the value just has to be a sane Some.
+        let avail = available_bytes(crate::state::testsupport::temp_dir("statvfs").as_str());
+        assert!(avail.is_some_and(|b| b > 0));
+    }
+
+    #[test]
+    fn wipe_dir_children_empties_but_keeps_the_root() {
+        let root = std::path::PathBuf::from(crate::state::testsupport::temp_dir("wipe"));
+        std::fs::create_dir_all(root.join("vfs/dir/deeper")).unwrap();
+        std::fs::write(root.join("vfs/dir/deeper/layer"), b"x").unwrap();
+        std::fs::write(root.join("engine-id"), b"x").unwrap();
+        std::os::unix::fs::symlink("/nonexistent-target", root.join("dangling")).unwrap();
+
+        wipe_dir_children(&root);
+
+        // The mount point itself must survive; its contents must not.
+        assert!(root.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn wipe_dir_children_tolerates_a_missing_root() {
+        // Pristine image: /var/lib/docker may not exist yet. Must not log
+        // spurious warnings or panic.
+        wipe_dir_children(std::path::Path::new("/definitely/not/a/real/path"));
     }
 }

@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -47,8 +47,9 @@ http-body-util = "0.1"
 async-trait = "0.1"
 # In-memory secret hygiene: tokens, App PEM, webhook secret.
 secrecy = { version = "0.10", features = ["serde"] }
-# Replaces raw `libc` in the entrypoint (SIGTERM, RLIMIT_NOFILE). musl-clean.
-nix = { version = "0.31", default-features = false, features = ["signal", "resource"] }
+# Replaces raw `libc` in the entrypoint (SIGTERM, RLIMIT_NOFILE, statvfs
+# for the docker data-root free-space guard). musl-clean.
+nix = { version = "0.31", default-features = false, features = ["signal", "resource", "fs"] }
 # GitHub %Y-%m-%dT%H:%M:%SZ parsing (dispatcher gtime); std-only, no tzdb baggage.
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 # Promoted from per-crate deps (dispatcher + webhook-proxy Function-URL bodies).

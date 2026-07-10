@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
 module's release tags (`artifact_version`).
 
+## [v0.0.8]
+
+### Fixed
+
+- **ENOSPC bakes: no more vfs fallback, plus a data-root free-space
+  guard** — a monorepo bake died `no space left on device`, and a
+  live-VM disk fingerprint showed why: guests have a FIXED 32GB root
+  filesystem (the microvm API has no storage knob — `Resources` carries
+  only `minimum_memory_in_mib`), `/var/lib/docker` persists across pool
+  suspend/resume with no GC, and the supervisor's `overlay2 → vfs`
+  storage-driver fallback had silently degraded a pooled VM to **vfs**,
+  whose full-copy layers (no CoW) had ballooned to 12GB and left
+  mixed-driver metadata corruption behind (`docker system df` erroring
+  on missing overlay2 diffs). Changes: (1) the vfs fallback is REMOVED —
+  dockerd runs the configured driver only, and when it fails repeatedly
+  the supervisor now wipes the data-root once (corrupt-state recovery)
+  and retries overlay2 fresh instead of degrading; (2) before each
+  job's dockerd starts, the supervisor wipes the data-root when the
+  filesystem's free space is under **`DOCKER_MIN_FREE_GB`** (default
+  16, override via `runner_environment_variables`) — a wipe costs one
+  cold layer pull (registry `cache-from` covers rebuild speed), an
+  ENOSPC costs the job. Wipes remove the data-root's children only
+  (it can be a mount point) and are logged with before/after free
+  space.
+
 ## [v0.0.7]
 
 ### Fixed
