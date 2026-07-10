@@ -48,12 +48,13 @@ async fn main() {
     ));
     // Before any child: dockerd + runner inherit these.
     rlimit::raise_nofile_rlimit(&cfg);
-    // Also before any child: on a v4-only egress connector, blackhole global
-    // guest IPv6 (unreachable default route) so dual-stack clients fail v6
-    // instantly and fall back to v4 — link-local v6 stays up for the
-    // platform's hook channel (see ipv6.rs for why a full stack disable is
-    // forbidden). No-op unless DISABLE_IPV6 is set.
-    ipv6::blackhole_ipv6_if_requested();
+    // Also before any child: on a v4-only egress connector, make
+    // guest-initiated v6 connects fail instantly (ip6tables --syn REJECT) so
+    // dual-stack clients fall back to v4 — the guest's v6 address and routes
+    // stay untouched for the platform's hook channel (see ipv6.rs for why
+    // route or sysctl mutation is forbidden). No-op unless DISABLE_IPV6 is
+    // set.
+    ipv6::restrict_ipv6_egress_if_requested();
     // dockerd is NOT started here: it comes up fresh per job in the run
     // task so its bridge/NAT/DNS reflect the live MicroVM network.
     let region = config::region_label();

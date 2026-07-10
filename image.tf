@@ -33,11 +33,12 @@ resource "awscc_lambda_microvm_image" "runner" {
   # Cloud Control marks EnvironmentVariables as a required key and the provider
   # omits an empty set, so ship one harmless marker. The runner's real config
   # comes from the Dockerfile ENV, not from here. DISABLE_IPV6 makes the
-  # supervisor blackhole global guest IPv6 at boot (unreachable default route
-  # + accept_ra=0 — NOT the disable_ipv6 sysctls, which kill link-local and
-  # fail the READY probe NotStabilized; see variables.tf) — for IPv4-only
-  # egress connectors, where dual-stack clients otherwise waste a doomed
-  # happy-eyeballs IPv6 attempt per connection.
+  # supervisor install an ip6tables --syn REJECT at boot (guest-initiated v6
+  # TCP to global unicast gets an instant RST — NOT route or sysctl mutation,
+  # both of which broke the platform's hook channel and failed the READY
+  # probe NotStabilized; see variables.tf) — for IPv4-only egress connectors,
+  # where dual-stack clients otherwise waste a doomed happy-eyeballs IPv6
+  # attempt per connection.
   environment_variables = concat(
     [{ key = "GHA_RUNNER_MICROVM", value = "1" }],
     var.disable_guest_ipv6 ? [{ key = "DISABLE_IPV6", value = "1" }] : [],

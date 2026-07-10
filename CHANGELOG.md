@@ -4,6 +4,38 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
 module's release tags (`artifact_version`).
 
+## [v0.0.7]
+
+### Fixed
+
+- **`disable_guest_ipv6` is now an ip6tables fast-fail — v0.0.6's route
+  blackhole ALSO failed image builds NotStabilized** — both prior
+  mechanisms broke the platform's hook channel, and a live-fleet network
+  fingerprint finally explained why. The guest's IPv6 is not SLAAC: the
+  platform statically installs a global `/128` on eth0 (`accept_ra` is
+  already 0 in the base config — v0.0.6's accept_ra writes were no-ops; no
+  link-local address exists), a static `default via fe80::1` with a
+  PERMANENT neighbor entry, and a hidden guest agent listening on `*:8443`
+  over that address. Lifecycle hooks travel control plane → agent `:8443`
+  (over guest global v6, from an **off-link** source) → `127.0.0.1:9000`
+  (the supervisor's hook server). v0.0.5's `disable_ipv6` sysctls deleted
+  the `/128` (agent unreachable); v0.0.6's `unreachable default metric 1`
+  route outranked the platform's static default and dropped the agent's
+  **reply** packets — either way the READY probe timed out (`Ready hook
+  invocation timed out after PT2M`) on every build, both Graviton
+  generations. v0.0.7 keeps the deployed surface exactly
+  (`disable_guest_ipv6` variable, `DISABLE_IPV6=1` image env, same lenient
+  truthy parse) but the supervisor now inserts **one direction-aware
+  ip6tables rule** (`ip6tables -w -I OUTPUT -d 2000::/3 -p tcp --syn -j
+  REJECT --reject-with tcp-reset`): guest-initiated TCP connects to
+  global-unicast v6 get an instant local RST (happy-eyeballs falls back to
+  v4 in microseconds — the speedup the flag is for), while `--syn`
+  (SYN-without-ACK) can never match the agent's inbound flow or its
+  replies, and no address, route, or sysctl is touched. Failure
+  warns-and-continues (boot is never blocked); success logs `ipv6 egress
+  fast-fail installed (DISABLE_IPV6 set - guest-initiated v6 TCP gets
+  RST)`.
+
 ## [v0.0.6]
 
 ### Fixed

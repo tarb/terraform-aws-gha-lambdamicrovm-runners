@@ -1,5 +1,5 @@
-//! Optional guest IPv6 blackhole (`DISABLE_IPV6`), applied at supervisor
-//! boot.
+//! Optional guest IPv6 egress fast-fail (`DISABLE_IPV6`), applied at
+//! supervisor boot.
 //!
 //! Why: the fleet's egress connector can be IPv4-only (NetworkConnector
 //! VpcEgressConfiguration `network_protocol = "IPv4"`), but the guest has no
@@ -8,116 +8,101 @@
 //! against a protocol that can never work, a per-connection tax that turned
 //! a ~1min install into ~11min. When the operator knows the connector is
 //! v4-only, `DISABLE_IPV6=1` (baked into the image env by the module's
-//! `disable_guest_ipv6` variable) removes the entire class before anything
-//! dials out.
+//! `disable_guest_ipv6` variable) makes those doomed attempts fail instantly
+//! instead.
 //!
-//! Mechanism — an UNREACHABLE default route, NOT a stack disable: we run
-//! `ip -6 route replace unreachable default metric 1` and set
-//! `net.ipv6.conf.{all,default}.accept_ra=0`. Global v6 destinations then
-//! fail instantly with ENETUNREACH (happy-eyeballs falls back to v4 with
-//! zero timeout) while link-local and loopback IPv6 keep working.
+//! Mechanism — a direction-aware ip6tables REJECT, and NOTHING else:
+//! guest-initiated TCP connects to global-unicast v6 (`2000::/3`) are
+//! answered with a local RST (`--reject-with tcp-reset`), so happy-eyeballs
+//! falls back to v4 in microseconds. `--syn` matches only SYN-without-ACK,
+//! i.e. only connections the GUEST initiates — reply traffic to inbound
+//! connections (SYN-ACKs carry ACK) passes untouched.
 //!
-//! DO NOT "simplify" this back to the `disable_ipv6` sysctls. v0.0.5 did
-//! exactly that, and every image build with the flag on failed
-//! NotStabilized: the platform's lifecycle READY probe (which boots a VM
-//! from the candidate image and dials the hook server) depends on IPv6 —
-//! most plausibly link-local — somewhere in its channel, so disabling the
-//! whole v6 stack breaks the platform contract. The unreachable route only
-//! kills GLOBAL v6 routing and leaves the stack (and the probe's channel)
-//! intact.
+//! DO NOT "simplify" this to route or sysctl mutation. Both were shipped and
+//! both broke the platform, discovered via image builds failing
+//! NotStabilized ("Ready hook invocation timed out after PT2M"):
+//!
+//! - v0.0.5 set the `disable_ipv6` sysctls. That deletes the guest's IPv6
+//!   address entirely.
+//! - v0.0.6 installed `ip -6 route replace unreachable default metric 1`
+//!   (+ `accept_ra=0`, which turned out to be a no-op — the platform's own
+//!   base config already sets it). The unreachable route outranked the
+//!   platform's static `default via fe80::1` and silently dropped REPLY
+//!   packets to off-link peers.
+//!
+//! What a live-fleet network fingerprint established (2026-07-10): the guest
+//! gets a statically installed global /128 (no SLAAC, no link-local, RA
+//! already off), a static `default via fe80::1`, and a hidden platform agent
+//! listening on `*:8443` over that address which forwards lifecycle hooks to
+//! our server via `127.0.0.1:9000`. The control plane dials the agent from
+//! an OFF-LINK global-unicast source, so the agent's replies need both the
+//! /128 address and the v6 default route. Any mechanism that removes the
+//! address or beats that route breaks the hook channel and every image
+//! build. The `--syn` REJECT touches neither: inbound flows and their
+//! replies are not SYN-only packets.
 
 use crate::config::{env_or, parse_flag};
 use crate::logfmt::{log, truncate_chars};
 use crate::supervisor::exit_code;
-use std::path::Path;
 
-/// Kernel sysctl root for the IPv6 knobs.
-const SYSCTL_IPV6_BASE: &str = "/proc/sys/net/ipv6";
-
-/// The blackhole: every global v6 destination resolves to an unreachable
-/// route, so connects fail instantly with ENETUNREACH. `metric 1` outranks
-/// any RA-installed default (those land around metric 1024) that might slip
-/// in before the accept_ra writes below take effect; `replace` is idempotent
-/// across warm-pool resumes.
-const BLACKHOLE_ROUTE_ARGV: &[&str] = &[
-    "ip",
-    "-6",
-    "route",
-    "replace",
-    "unreachable",
-    "default",
-    "metric",
-    "1",
+/// The fast-fail rule. `-w` waits on the shared xtables lock instead of
+/// racing dockerd's iptables calls; `-I OUTPUT` needs no pre-existing chain
+/// setup. Scoped to global unicast (`2000::/3`) so loopback, link-local and
+/// any platform-internal ULA traffic are never touched. Runs once per
+/// process start (suspend/resume does not restart pid 1), so duplicate
+/// inserts don't accumulate — and a duplicate would be behaviorally
+/// identical anyway.
+const REJECT_RULE_ARGV: &[&str] = &[
+    "ip6tables",
+    "-w",
+    "-I",
+    "OUTPUT",
+    "-d",
+    "2000::/3",
+    "-p",
+    "tcp",
+    "--syn",
+    "-j",
+    "REJECT",
+    "--reject-with",
+    "tcp-reset",
 ];
 
-/// Blackhole global guest IPv6 when the `DISABLE_IPV6` env flag is truthy
-/// (same lenient parsing as every other flag: `1`/`true`/`yes`). No-op when
-/// the flag is unset or falsy. Called at boot, before any child process —
-/// the runner and everything it spawns then see instant-fail global v6 and
-/// fall back to v4, while link-local v6 stays up for the platform's hook
-/// channel.
-pub fn blackhole_ipv6_if_requested() {
-    blackhole_ipv6(
-        &env_or("DISABLE_IPV6", ""),
-        &SystemCommands,
-        Path::new(SYSCTL_IPV6_BASE),
-    );
+/// Install the v6 egress fast-fail when the `DISABLE_IPV6` env flag is
+/// truthy (same lenient parsing as every other flag: `1`/`true`/`yes`).
+/// No-op when the flag is unset or falsy. Called at boot, before any child
+/// process — the runner and everything it spawns then see instant-RST global
+/// v6 connects and fall back to v4, while the platform's inbound hook
+/// channel keeps working.
+pub fn restrict_ipv6_egress_if_requested() {
+    restrict_ipv6_egress(&env_or("DISABLE_IPV6", ""), &SystemCommands);
 }
 
-/// Gate + both mechanisms. Every failure warns and continues — a v4-only
-/// guest must still boot — and exactly one success line is logged when both
-/// the route and the accept_ra writes landed. Parameterised (flag value,
-/// command seam, sysctl base) so tests drive it without touching the
-/// process env, the real `ip`, or /proc.
-fn blackhole_ipv6(flag: &str, commands: &dyn CommandRunner, sysctl_base: &Path) {
+/// Gate + mechanism. Failure warns and continues — a guest without
+/// ip6tables (or without the kernel modules) must still boot; it just keeps
+/// the happy-eyeballs tax. Parameterised (flag value, command seam) so tests
+/// drive it without touching the process env or the real ip6tables.
+fn restrict_ipv6_egress(flag: &str, commands: &dyn CommandRunner) {
     if !parse_flag(flag) {
         return;
     }
-    let route_ok = match commands.run(BLACKHOLE_ROUTE_ARGV) {
-        Ok(()) => true,
-        Err(e) => {
-            log(format!(
-                "WARN: could not install unreachable ipv6 default route: {e}"
-            ));
-            false
-        }
-    };
-    let ra_ok = reject_router_advertisements(sysctl_base);
-    if route_ok && ra_ok {
-        log("ipv6 global routes blackholed (DISABLE_IPV6 set - v4-only egress)");
+    match commands.run(REJECT_RULE_ARGV) {
+        Ok(()) => log(
+            "ipv6 egress fast-fail installed (DISABLE_IPV6 set - guest-initiated v6 TCP gets RST)",
+        ),
+        Err(e) => log(format!(
+            "WARN: could not install ipv6 egress fast-fail rule: {e}"
+        )),
     }
 }
 
-/// Write `0` to `conf/{all,default}/accept_ra` under `base`, so a later
-/// router advertisement can't install a real default route behind the
-/// blackhole. These knobs do NOT disable the stack — link-local v6 stays
-/// fully functional (unlike `disable_ipv6`; see the module docs for the
-/// NotStabilized incident). Absent paths (kernel built without IPv6) and
-/// write failures are tolerated with one WARN each. Returns true only when
-/// every write landed. `base` is a parameter so tests run against a temp
-/// dir.
-fn reject_router_advertisements(base: &Path) -> bool {
-    let mut all_ok = true;
-    for scope in ["all", "default"] {
-        let path = base.join("conf").join(scope).join("accept_ra");
-        if let Err(e) = std::fs::write(&path, "0") {
-            log(format!(
-                "WARN: could not set accept_ra=0 at {}: {e}",
-                path.display()
-            ));
-            all_ok = false;
-        }
-    }
-    all_ok
-}
-
-/// Seam for the `ip` shell-out so a unit test asserts the exact argv without
-/// running anything — the same hand-rolled-fake pattern as
+/// Seam for the `ip6tables` shell-out so a unit test asserts the exact argv
+/// without running anything — the same hand-rolled-fake pattern as
 /// [`crate::aws::CloudControl`].
 trait CommandRunner {
     /// Run `argv[0]` with the remaining args. `Err` carries a one-line
     /// human-readable reason: spawn failure (including a missing binary,
-    /// e.g. an image built without iproute) or a non-zero exit.
+    /// e.g. an image built without iptables) or a non-zero exit.
     fn run(&self, argv: &[&str]) -> Result<(), String>;
 }
 
@@ -145,8 +130,6 @@ impl CommandRunner for SystemCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::testsupport::temp_dir;
-    use std::path::PathBuf;
     use std::sync::Mutex;
 
     /// Recorded argv per call, with an optional scripted failure.
@@ -169,93 +152,58 @@ mod tests {
         }
     }
 
-    /// A fake /proc/sys/net/ipv6 with both conf scopes present.
-    fn sysctl_tree(tag: &str) -> PathBuf {
-        let base = PathBuf::from(temp_dir(tag));
-        for scope in ["all", "default"] {
-            std::fs::create_dir_all(base.join("conf").join(scope)).unwrap();
-        }
-        base
-    }
-
-    fn read_accept_ra(base: &Path, scope: &str) -> String {
-        std::fs::read_to_string(base.join("conf").join(scope).join("accept_ra")).unwrap()
-    }
-
     #[test]
-    fn truthy_flag_runs_exact_ip_argv_and_rejects_ras() {
-        let base = sysctl_tree("ipv6-blackhole");
+    fn truthy_flag_runs_exact_ip6tables_argv() {
         let fake = FakeCommands::default();
-        blackhole_ipv6("1", &fake, &base);
-        // Exactly one `ip` invocation, argv verbatim: the unreachable
-        // default route at metric 1 (NOT a disable_ipv6 sysctl — see the
-        // module docs for the NotStabilized incident).
+        restrict_ipv6_egress("1", &fake);
+        // Exactly one ip6tables invocation, argv verbatim: a --syn REJECT
+        // scoped to global unicast. NOT a route, NOT a sysctl — both broke
+        // the platform's hook channel (see the module docs for the
+        // v0.0.5/v0.0.6 NotStabilized incidents).
         assert_eq!(
             fake.runs.lock().unwrap().as_slice(),
             [[
-                "ip",
-                "-6",
-                "route",
-                "replace",
-                "unreachable",
-                "default",
-                "metric",
-                "1"
+                "ip6tables",
+                "-w",
+                "-I",
+                "OUTPUT",
+                "-d",
+                "2000::/3",
+                "-p",
+                "tcp",
+                "--syn",
+                "-j",
+                "REJECT",
+                "--reject-with",
+                "tcp-reset"
             ]
             .map(String::from)]
         );
-        for scope in ["all", "default"] {
-            assert_eq!(read_accept_ra(&base, scope), "0");
-        }
     }
 
     #[test]
     fn unset_or_falsy_flag_is_a_complete_noop() {
         // "" is what the env_or default yields when DISABLE_IPV6 is unset.
         for flag in ["", "0", "false", "off"] {
-            let base = sysctl_tree(&format!("ipv6-noop-{flag}"));
             let fake = FakeCommands::default();
-            blackhole_ipv6(flag, &fake, &base);
-            assert!(fake.runs.lock().unwrap().is_empty(), "flag {flag:?} ran ip");
-            for scope in ["all", "default"] {
-                assert!(
-                    !base.join("conf").join(scope).join("accept_ra").exists(),
-                    "flag {flag:?} wrote accept_ra"
-                );
-            }
+            restrict_ipv6_egress(flag, &fake);
+            assert!(
+                fake.runs.lock().unwrap().is_empty(),
+                "flag {flag:?} ran ip6tables"
+            );
         }
     }
 
     #[test]
-    fn route_failure_warns_but_still_rejects_ras() {
-        // e.g. an image built without iproute: warn-and-continue, never
-        // block boot — and the RA rejection still lands.
-        let base = sysctl_tree("ipv6-route-fail");
+    fn rule_failure_warns_and_continues() {
+        // e.g. an image built without iptables, or missing kernel modules:
+        // warn-and-continue, never block boot — the guest just keeps the
+        // happy-eyeballs tax.
         let fake = FakeCommands {
-            fail_with: Some("ip not found in image - skipping".to_string()),
+            fail_with: Some("ip6tables not found in image - skipping".to_string()),
             ..Default::default()
         };
-        blackhole_ipv6("true", &fake, &base);
-        for scope in ["all", "default"] {
-            assert_eq!(read_accept_ra(&base, scope), "0");
-        }
-    }
-
-    #[test]
-    fn absent_sysctl_tree_is_tolerated() {
-        // Kernel without IPv6: the conf tree simply isn't there.
-        let base = PathBuf::from(temp_dir("ipv6-absent")).join("missing");
-        assert!(!reject_router_advertisements(&base));
-    }
-
-    #[test]
-    fn unwritable_scope_warns_but_still_writes_the_other() {
-        let base = PathBuf::from(temp_dir("ipv6-unwritable"));
-        // A directory where the file should be fails the write (EISDIR)
-        // regardless of privileges — unlike a chmod, this also fails as root.
-        std::fs::create_dir_all(base.join("conf/all/accept_ra")).unwrap();
-        std::fs::create_dir_all(base.join("conf/default")).unwrap();
-        assert!(!reject_router_advertisements(&base));
-        assert_eq!(read_accept_ra(&base, "default"), "0");
+        restrict_ipv6_egress("true", &fake);
+        assert_eq!(fake.runs.lock().unwrap().len(), 1);
     }
 }
