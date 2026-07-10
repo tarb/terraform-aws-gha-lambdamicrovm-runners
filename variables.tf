@@ -29,7 +29,7 @@ variable "artifacts_bucket_name" {
 variable "artifact_version" {
   description = "GitHub release of this module whose prebuilt artifacts (dispatcher.zip, webhook-proxy.zip, entrypoint) are deployed; releases are built by .github/workflows/release.yml."
   type        = string
-  default     = "v0.0.8"
+  default     = "v0.0.9"
 }
 
 ###############################################################################
@@ -211,35 +211,6 @@ variable "egress_network_connector_arn" {
   description = "Customer-managed Lambda network connector ARN for VPC egress (reach private resources: VPC endpoints, internal services, private cluster APIs). null = AWS-managed INTERNET_EGRESS."
   type        = string
   default     = null
-}
-
-variable "disable_guest_ipv6" {
-  description = <<-EOT
-    Make guest-initiated IPv6 connects fail fast inside guest MicroVMs
-    (v4-only egress). Set true when the egress connector is IPv4-only
-    (NetworkConnector VpcEgressConfiguration network_protocol = "IPv4"): the
-    guest can't tell, so dual-stack clients (observed: bun's highly
-    concurrent package fetches) burn a happy-eyeballs IPv6 attempt per
-    connection against a protocol that can never work — a per-connection tax
-    that turned a ~1min install into ~11min. Implemented by baking
-    DISABLE_IPV6=1 into the image environment (changing this triggers an
-    image rebuild); at boot the supervisor inserts one ip6tables rule:
-    outbound TCP SYNs to global unicast (2000::/3) are REJECTed with a local
-    RST, so happy-eyeballs falls back to v4 in microseconds.
-    It deliberately touches NOTHING else — not the disable_ipv6 sysctls
-    (v0.0.5: deletes the guest's statically-installed global /128 address),
-    not v6 routes (v0.0.6: an unreachable default route outranked the
-    platform's static "default via fe80::1" and dropped reply packets).
-    Both variants made every image build fail NotStabilized ("Ready hook
-    invocation timed out"): the platform delivers lifecycle hooks through a
-    hidden guest agent on *:8443, reached over the guest's global v6 address
-    from an off-link source, then forwarded to the hook server via
-    127.0.0.1. The --syn REJECT never matches that inbound flow or its
-    replies. Do not "fix" this back to route or sysctl mutation. Leave false
-    for DualStack connectors and the managed INTERNET_EGRESS default.
-  EOT
-  type        = bool
-  default     = false
 }
 
 variable "runner_environment_variables" {

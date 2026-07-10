@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
 module's release tags (`artifact_version`).
 
+## [v0.0.9]
+
+### Removed
+
+- **v0.0.8's disk-guard machinery** (the `DOCKER_MIN_FREE_GB` free-space
+  wipe before each job's dockerd and the wipe-and-retry recovery between
+  failed dockerd starts). The ENOSPC that motivated v0.0.8 was caused by
+  the vfs fallback itself — full-copy layers — not by organic overlay2
+  accumulation, which is bounded by the VM's max lifetime and has never
+  approached the 32GB limit. What actually fixed the incident stays: **no
+  driver fallback** — dockerd runs the configured driver only and fails
+  loudly rather than degrading to vfs. If a real overlay2 ENOSPC is ever
+  observed, add a measured fix then; guards for hypotheticals are how the
+  v0.0.5–v0.0.8 ipv6 saga happened.
+- **The `disable_guest_ipv6` feature, entirely** (variable, `DISABLE_IPV6`
+  image env, the entrypoint's ip6tables rule, and the image's `iproute`
+  package). The problem it chased — dual-stack clients stalling against a
+  v4-only egress connector — turned out to be app-layer: the stall only
+  exists inside docker builds (the host resolver stub serves no AAAA;
+  build sandboxes resolve via dockerd's `--dns`, which does), and the one
+  affected client was bun, whose install/fetch connect path has no
+  happy-eyeballs timer (oven-sh/bun#32864) — fixed in the workload's own
+  Dockerfile with `BUN_FEATURE_FLAG_DISABLE_IPV6=1` (bun ignores
+  `NODE_OPTIONS`, oven-sh/bun#28817; clients with working happy-eyeballs
+  never stalled). Three releases of guest-side mechanisms taught us the
+  guest's IPv6 state is the platform's hook transport and must never be
+  mutated — that lore stays in ARCHITECTURE.md §4.5 so nobody re-learns it
+  the NotStabilized way. Consumers upgrading from ≤v0.0.8 must drop any
+  `disable_guest_ipv6` argument.
+
 ## [v0.0.8]
 
 ### Fixed

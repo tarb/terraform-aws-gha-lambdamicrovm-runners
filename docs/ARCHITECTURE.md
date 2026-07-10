@@ -294,32 +294,28 @@ dispatcher's `iam:PassRole` is scoped to the exec role ARN only.
   `VPC_EGRESS` connector if you need private networking / a fixed egress IP (then
   the control-plane self-terminate call needs a NAT or an `lambda-microvms`
   interface VPC endpoint).
-- **IPv6** - if your egress connector is IPv4-only (VpcEgressConfiguration
-  `network_protocol = "IPv4"`), set `disable_guest_ipv6 = true`: the guest can't
-  tell the connector is v4-only, so dual-stack clients (observed: bun's highly
-  concurrent package fetches) waste a happy-eyeballs IPv6 attempt per connection
-  against a protocol that can never work — a per-connection tax that turned a
-  ~1min install into ~11min. The flag bakes `DISABLE_IPV6=1` into the image env
-  (an image rebuild); at boot the supervisor inserts **one ip6tables rule**
-  (`ip6tables -w -I OUTPUT -d 2000::/3 -p tcp --syn -j REJECT --reject-with
-  tcp-reset`): guest-initiated TCP connects to global-unicast v6 get an
-  instant local RST — immediate v4 fallback.
-  **The guest's IPv6 state is the platform's property — never mutate it.** A
-  live-fleet fingerprint (2026-07-10) showed the platform statically installs
-  a global `/128` on eth0 (no SLAAC, no link-local address, `accept_ra`
-  already 0), a static `default via fe80::1` with a PERMANENT neighbor entry,
-  and a hidden guest agent listening on `*:8443` over that address — the
-  lifecycle hook path is: control plane → agent `:8443` (over guest global
-  v6, from an **off-link** source) → `127.0.0.1:9000` (the supervisor's hook
-  server; that's why the final hop works on a v4-only listener). Two
-  mechanisms shipped before this was understood, and both made every image
-  build fail NotStabilized (`Ready hook invocation timed out after PT2M`):
-  v0.0.5's `disable_ipv6` sysctls delete the `/128` (agent unreachable);
-  v0.0.6's `unreachable default metric 1` route outranked the platform's
-  default and dropped the agent's **reply** packets to the off-link control
-  plane. The `--syn` REJECT matches only SYN-without-ACK — i.e. only
-  guest-initiated connects — so the agent's inbound flow and its replies pass
-  untouched. Leave the flag off for DualStack connectors.
+- **IPv6** - **the guest's IPv6 state is the platform's property — never
+  mutate it.** A live-fleet fingerprint (2026-07-10) showed the platform
+  statically installs a global `/128` on eth0 (no SLAAC, no link-local
+  address, `accept_ra` already 0), a static `default via fe80::1` with a
+  PERMANENT neighbor entry, and a hidden guest agent listening on `*:8443`
+  over that address — the lifecycle hook path is: control plane → agent
+  `:8443` (over guest global v6, from an **off-link** source) →
+  `127.0.0.1:9000` (the supervisor's hook server; that's why the final hop
+  works on a v4-only listener). Module v0.0.5–v0.0.8 shipped guest-side
+  mitigations for dual-stack clients stalling on v4-only egress connectors
+  (`disable_ipv6` sysctls, an unreachable-route blackhole, an ip6tables
+  `--syn` REJECT); the first two made every image build fail NotStabilized
+  (`Ready hook invocation timed out` — sysctls delete the `/128`, the route
+  outranked the platform default and dropped the agent's replies), and the
+  whole feature was removed in v0.0.9. The right fix is **app-layer, in the
+  workload's own build**: the stall only exists inside docker builds anyway
+  (the HOST resolver stub serves no AAAA; build sandboxes resolve via
+  dockerd's `--dns 169.254.169.253`, which does), and the observed offender —
+  bun, whose connect path has no happy-eyeballs timer (oven-sh/bun#32864) —
+  is fixed with `BUN_FEATURE_FLAG_DISABLE_IPV6=1` in the Dockerfile (note:
+  bun ignores `NODE_OPTIONS` entirely, oven-sh/bun#28817). Clients with
+  working happy-eyeballs (curl, node, browsers) never stalled.
 - **Ingress** - the runner needs **none** (it dials out to GitHub). GitHub POSTs
   webhooks to the *webhook-proxy*'s public **Lambda Function URL** (authType NONE),
   which gives GitHub a plain public `https://…/` to POST to; events then reach the
@@ -387,19 +383,17 @@ Four non-obvious problems, all solved in the entrypoint supervisor (`crates/entr
    raise the hard limit up to `fs.nr_open`), and passes
    `--default-ulimit nofile=...` (clamped to the achieved hard limit) so plain
    containers get an explicit sane default too.
-4. **A fixed 32GB disk shared with a persistent data-root.** The microvm API has
-   no storage knob (`Resources` is `minimum_memory_in_mib` only), everything
+4. **A fixed 32GB disk — never fall back to `vfs`.** The microvm API has no
+   storage knob (`Resources` is `minimum_memory_in_mib` only), everything
    lives on one 32GB root filesystem, and `/var/lib/docker` survives pool
-   suspend/resume with no GC — so reused pool VMs accumulate build cache until
-   some bake dies `no space left on device`. Worse, the old `overlay2 → vfs`
-   driver fallback meant a corrupt data-root silently degraded to `vfs`, whose
-   full-copy layers (no CoW) turn one monorepo bake into 12GB+ and poison the
-   data-root with mixed-driver metadata. **Fix:** the fallback is gone (a
-   repeatedly-failing dockerd gets a data-root **wipe + overlay2 retry**
-   instead), and before each job's dockerd starts the supervisor wipes the
-   data-root if free space is under **`DOCKER_MIN_FREE_GB`** (default 16, set
-   via `runner_environment_variables`) — registry `cache-from` covers the lost
-   warm layers.
+   suspend/resume. The old `overlay2 → vfs` driver fallback silently degraded
+   a pooled VM to `vfs`, whose full-copy layers (no CoW) turned one monorepo
+   bake into 12GB+ and an ENOSPC, while poisoning the data-root with
+   mixed-driver metadata. **Fix:** the fallback is gone — dockerd runs the
+   configured driver only, and a dockerd that won't start fails loudly
+   (dockerd.log tail in the job log) instead of degrading. Accumulation
+   across pool reuse is bounded by the VM's max lifetime; under overlay2's
+   CoW it has never approached the disk limit.
 
 > **Gotcha for workloads:** `docker/build-push-action` spins up its own
 > *buildx-container* builder (a separate network namespace), which re-introduces
