@@ -29,7 +29,7 @@ variable "artifacts_bucket_name" {
 variable "artifact_version" {
   description = "GitHub release of this module whose prebuilt artifacts (dispatcher.zip, webhook-proxy.zip, entrypoint) are deployed; releases are built by .github/workflows/release.yml."
   type        = string
-  default     = "v0.0.5"
+  default     = "v0.0.6"
 }
 
 ###############################################################################
@@ -215,16 +215,24 @@ variable "egress_network_connector_arn" {
 
 variable "disable_guest_ipv6" {
   description = <<-EOT
-    Disable IPv6 inside guest MicroVMs. Set true when the egress connector is
-    IPv4-only (NetworkConnector VpcEgressConfiguration network_protocol =
-    "IPv4"): the guest can't tell, so dual-stack clients (observed: bun's
-    highly concurrent package fetches) burn a happy-eyeballs IPv6 attempt per
-    connection against a protocol that can never work — a per-connection tax
-    that turned a ~1min install into ~11min. Implemented by baking
-    DISABLE_IPV6=1 into the image environment (changing this triggers an
-    image rebuild); the supervisor then writes the kernel's disable_ipv6
-    sysctls at boot. Leave false for DualStack connectors and the managed
-    INTERNET_EGRESS default.
+    Blackhole global IPv6 inside guest MicroVMs (v4-only egress). Set true
+    when the egress connector is IPv4-only (NetworkConnector
+    VpcEgressConfiguration network_protocol = "IPv4"): the guest can't tell,
+    so dual-stack clients (observed: bun's highly concurrent package fetches)
+    burn a happy-eyeballs IPv6 attempt per connection against a protocol that
+    can never work — a per-connection tax that turned a ~1min install into
+    ~11min. Implemented by baking DISABLE_IPV6=1 into the image environment
+    (changing this triggers an image rebuild); at boot the supervisor then
+    installs an unreachable default IPv6 route (ip -6 route replace
+    unreachable default metric 1) and sets accept_ra=0, so global v6
+    destinations fail instantly with ENETUNREACH (happy-eyeballs falls back
+    to v4 with zero timeout) while link-local/loopback IPv6 keep working.
+    It deliberately does NOT flip the kernel's disable_ipv6 sysctls: v0.0.5
+    did, and every image build with the flag on failed NotStabilized — the
+    platform's lifecycle READY probe depends on IPv6 (most plausibly
+    link-local) in its hook channel, so a full stack disable breaks the
+    platform contract. Do not "fix" this back. Leave false for DualStack
+    connectors and the managed INTERNET_EGRESS default.
   EOT
   type        = bool
   default     = false

@@ -300,8 +300,14 @@ dispatcher's `iam:PassRole` is scoped to the exec role ARN only.
   concurrent package fetches) waste a happy-eyeballs IPv6 attempt per connection
   against a protocol that can never work — a per-connection tax that turned a
   ~1min install into ~11min. The flag bakes `DISABLE_IPV6=1` into the image env
-  (an image rebuild) and the supervisor flips the kernel's `disable_ipv6`
-  sysctls at boot; leave it off for DualStack connectors.
+  (an image rebuild); at boot the supervisor installs an **unreachable default
+  IPv6 route** (`ip -6 route replace unreachable default metric 1`, plus
+  `accept_ra=0` so an RA can't re-add a real default), making global v6 fail
+  instantly with ENETUNREACH — immediate v4 fallback — while link-local v6
+  stays up. It must NOT disable the whole v6 stack (`disable_ipv6` sysctls):
+  v0.0.5 did, and image builds failed NotStabilized because the platform's
+  lifecycle READY probe depends on IPv6 (most plausibly link-local) in its
+  hook channel. Leave the flag off for DualStack connectors.
 - **Ingress** - the runner needs **none** (it dials out to GitHub). GitHub POSTs
   webhooks to the *webhook-proxy*'s public **Lambda Function URL** (authType NONE),
   which gives GitHub a plain public `https://…/` to POST to; events then reach the

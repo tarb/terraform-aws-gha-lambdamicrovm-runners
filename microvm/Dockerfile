@@ -38,7 +38,9 @@ RUN set -eux; \
 # containers only work when the MicroVM image is created with
 # additionalOsCapabilities:["ALL"]. There is no systemd in the container, so
 # dockerd is started directly by the entrypoint supervisor.
-RUN dnf install -y --setopt=install_weak_deps=0 docker iptables \
+# iproute (`ip`) is also required by the supervisor's DISABLE_IPV6 handling:
+# it installs an unreachable default IPv6 route at boot (see ipv6.rs).
+RUN dnf install -y --setopt=install_weak_deps=0 docker iptables iproute \
     && dnf clean all \
     && rm -rf /var/cache/dnf /var/cache/libdnf5
 

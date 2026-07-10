@@ -33,7 +33,9 @@ resource "awscc_lambda_microvm_image" "runner" {
   # Cloud Control marks EnvironmentVariables as a required key and the provider
   # omits an empty set, so ship one harmless marker. The runner's real config
   # comes from the Dockerfile ENV, not from here. DISABLE_IPV6 makes the
-  # supervisor flip the guest's disable_ipv6 sysctls at boot — for IPv4-only
+  # supervisor blackhole global guest IPv6 at boot (unreachable default route
+  # + accept_ra=0 — NOT the disable_ipv6 sysctls, which kill link-local and
+  # fail the READY probe NotStabilized; see variables.tf) — for IPv4-only
   # egress connectors, where dual-stack clients otherwise waste a doomed
   # happy-eyeballs IPv6 attempt per connection.
   environment_variables = concat(

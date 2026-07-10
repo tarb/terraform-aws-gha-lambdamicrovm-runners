@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
 module's release tags (`artifact_version`).
 
+## [v0.0.6]
+
+### Fixed
+
+- **`disable_guest_ipv6` blackholes global v6 instead of disabling the
+  stack — v0.0.5 image builds failed NotStabilized** — v0.0.5 implemented
+  the flag by writing the kernel's
+  `net.ipv6.conf.{all,default}.disable_ipv6=1` sysctls at supervisor boot,
+  and every image build with the flag on then died `NotStabilized`: the
+  platform's lifecycle READY probe (which boots a VM from the candidate
+  image and dials the hook server) depends on IPv6 — most plausibly
+  link-local — somewhere in its channel, so disabling the whole v6 stack
+  breaks the platform contract. (v0.0.5 was never released to a running
+  fleet: the failure hits at image build, before any VM serves a job.)
+  v0.0.6 keeps the deployed surface exactly (`disable_guest_ipv6` variable,
+  `DISABLE_IPV6=1` image env, same lenient truthy parse) but the supervisor
+  now installs an **unreachable default IPv6 route** (`ip -6 route replace
+  unreachable default metric 1`) and sets
+  `net.ipv6.conf.{all,default}.accept_ra=0` — so a later router
+  advertisement can't re-install a real default, and `metric 1` outranks
+  one that slips in first. Global v6 destinations fail instantly with
+  ENETUNREACH (happy-eyeballs falls back to v4 with zero timeout — the same
+  speedup v0.0.5 was after) while link-local/loopback IPv6 stay fully
+  functional for the platform's hook channel. All failures warn-and-continue
+  (boot is never blocked); success logs `ipv6 global routes blackholed
+  (DISABLE_IPV6 set - v4-only egress)`. The image now bakes `iproute` (the
+  `ip` tool); a supervisor landing on an older image warns and skips the
+  route but still writes the accept_ra sysctls.
+
 ## [v0.0.5]
 
 ### Added
