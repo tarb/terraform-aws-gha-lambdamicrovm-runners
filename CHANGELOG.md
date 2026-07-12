@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
 module's release tags (`artifact_version`).
 
+## [v0.0.11]
+
+### Added
+
+- **`var.sweep` tuning knobs** — `rate_minutes` (EventBridge cadence,
+  default 1, was a hardcoded 5) and `min_age_seconds` (how old a queued
+  job must be before the sweep re-dispatches, default 90, was a hardcoded
+  360). GitHub assigns jobs to runners itself, so when several
+  label-identical jobs queue together a VM dispatched for one job can be
+  handed another; the leftover job waits for the sweep. With the old
+  numbers that wait was up to ~11 minutes with idle capacity available;
+  the new defaults cap it around 2.5 minutes. The cost of over-eager
+  sweeping is bounded: a double-dispatched VM registers, finds no job,
+  and re-suspends within a minute.
+
+## [v0.0.10]
+
+### Changed
+
+- **Artifacts are fetched + staged at PLAN time** (`data.external`
+  replacing the `terraform_data` provisioner + `fileexists ? "present" :
+  timestamp()` replace dance). Every workspace holds the files before
+  anything reads them, so plans are clean on ephemeral CI workspaces —
+  no more churning `terraform_data.artifacts` and the S3 code artifact
+  on every plan, and no consumer-side CI caching folklore. Requires
+  bash + curl on the PLAN host (was apply-only) and the
+  `hashicorp/external` provider. Split plan/apply pipelines still ship
+  `.terraform-build/` with the plan artifact — note GitHub's
+  upload-artifact drops dot-paths unless `include-hidden-files: true`.
+
 ## [v0.0.9]
 
 ### Removed

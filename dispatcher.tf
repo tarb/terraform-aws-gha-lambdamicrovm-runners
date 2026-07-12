@@ -98,7 +98,7 @@ resource "aws_lambda_function" "dispatcher" {
       POOL_ENABLED          = var.warm_pool.enabled ? "true" : "false"
       POOL_MAX_SIZE         = tostring(var.warm_pool.max_size)
       SUSPEND_DELAY_SECONDS = "20"
-      SWEEP_MIN_AGE_SECONDS = "360"
+      SWEEP_MIN_AGE_SECONDS = tostring(var.sweep.min_age_seconds)
     }
   }
 
