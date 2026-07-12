@@ -239,7 +239,7 @@ resource "aws_lambda_event_source_mapping" "jobs" {
 resource "aws_cloudwatch_event_rule" "sweep" {
   name                = "${var.name_prefix}-sweep"
   description         = "reconcile GitHub queued jobs against the fleet"
-  schedule_expression = "rate(5 minutes)"
+  schedule_expression = var.sweep.rate_minutes == 1 ? "rate(1 minute)" : "rate(${var.sweep.rate_minutes} minutes)"
   tags                = local.tags
 }
 

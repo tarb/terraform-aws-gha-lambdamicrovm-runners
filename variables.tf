@@ -237,6 +237,15 @@ variable "max_concurrency" {
   default     = 0
 }
 
+variable "sweep" {
+  description = "Queued-job sweep tuning. GitHub assigns jobs to runners itself, so a VM dispatched for one job can be handed another (label-identical jobs queued together); the leftover job waits for the sweep. rate_minutes is the EventBridge cadence; min_age_seconds is how old a queued job must be before the sweep re-dispatches (long enough to let an in-flight webhook dispatch finish registering — resume is ~3s, runner registration ~30-60s). Worst-case pickup latency for a stolen job is min_age_seconds + rate_minutes."
+  type = object({
+    rate_minutes    = optional(number, 1)
+    min_age_seconds = optional(number, 90)
+  })
+  default = {}
+}
+
 variable "warm_pool" {
   description = "Suspend-based warm pool: finished VMs are SUSPENDED (near-free) instead of terminated, and resumed for the next job — skipping boot, dockerd start, and snapshot page-in. Requires the suspend/resume semantics validated on the service (see docs); ships disabled."
   type = object({
