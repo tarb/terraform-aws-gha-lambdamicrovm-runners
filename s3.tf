@@ -58,7 +58,9 @@ resource "aws_s3_object" "microvm_code" {
   # Pipelines that plan and apply in separate jobs must ship .terraform-build/
   # (the fetched artifacts + the staged image build context + this zip)
   # alongside the plan artifact (e.g. via an upload-artifact step between the
-  # plan and apply jobs).
+  # plan and apply jobs). GitHub gotcha: actions/upload-artifact drops
+  # dot-paths by default (v4.4+) and this dir lives under .terraform/ — set
+  # include-hidden-files: true or the artifact ships without it.
   source = data.archive_file.microvm_code.output_path
   etag   = data.archive_file.microvm_code.output_md5
   tags   = local.tags
