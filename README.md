@@ -133,6 +133,7 @@ See [docs/USAGE.md#custom-image](docs/USAGE.md#custom-image) for details.
 | <a name="requirement_archive"></a> [archive](#requirement\_archive) | >= 2.4 |
 | <a name="requirement_aws"></a> [aws](#requirement\_aws) | >= 6.0, < 7.0 |
 | <a name="requirement_awscc"></a> [awscc](#requirement\_awscc) | >= 1.0 |
+| <a name="requirement_external"></a> [external](#requirement\_external) | >= 2.3 |
 | <a name="requirement_github"></a> [github](#requirement\_github) | >= 6.2 |
 | <a name="requirement_random"></a> [random](#requirement\_random) | >= 3.6 |
 
@@ -143,9 +144,9 @@ See [docs/USAGE.md#custom-image](docs/USAGE.md#custom-image) for details.
 | <a name="provider_archive"></a> [archive](#provider\_archive) | 2.8.0 |
 | <a name="provider_aws"></a> [aws](#provider\_aws) | 6.54.0 |
 | <a name="provider_awscc"></a> [awscc](#provider\_awscc) | 1.92.0 |
+| <a name="provider_external"></a> [external](#provider\_external) | 2.4.0 |
 | <a name="provider_github"></a> [github](#provider\_github) | 6.13.0 |
 | <a name="provider_random"></a> [random](#provider\_random) | 3.9.0 |
-| <a name="provider_terraform"></a> [terraform](#provider\_terraform) | n/a |
 
 ## Modules
 
@@ -192,7 +193,6 @@ No modules.
 | [github_organization_webhook.runner](https://registry.terraform.io/providers/integrations/github/latest/docs/resources/organization_webhook) | resource |
 | [github_repository_webhook.runner](https://registry.terraform.io/providers/integrations/github/latest/docs/resources/repository_webhook) | resource |
 | [random_password.webhook](https://registry.terraform.io/providers/hashicorp/random/latest/docs/resources/password) | resource |
-| [terraform_data.artifacts](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
 | [archive_file.microvm_code](https://registry.terraform.io/providers/hashicorp/archive/latest/docs/data-sources/file) | data source |
 | [aws_caller_identity.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/caller_identity) | data source |
 | [aws_iam_policy_document.build](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
@@ -205,6 +205,7 @@ No modules.
 | [aws_iam_policy_document.proxy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
 | [aws_iam_policy_document.proxy_assume](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
 | [aws_region.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/region) | data source |
+| [external_external.artifacts](https://registry.terraform.io/providers/hashicorp/external/latest/docs/data-sources/external) | data source |
 
 ## Inputs
 
@@ -212,7 +213,7 @@ No modules.
 | ---- | ----------- | ---- | ------- | :------: |
 | <a name="input_additional_execution_policy_arns"></a> [additional\_execution\_policy\_arns](#input\_additional\_execution\_policy\_arns) | Extra IAM policy ARNs attached to the MicroVM execution role (e.g. sccache cache-bucket access, ECR push). | `list(string)` | `[]` | no |
 | <a name="input_additional_os_capabilities"></a> [additional\_os\_capabilities](#input\_additional\_os\_capabilities) | additionalOsCapabilities for the MicroVM image. ["ALL"] enables nested Docker / privileged ops (needed for `docker`/`services:` jobs). Set [] to tighten for non-Docker workloads. | `list(string)` | <pre>[<br/>  "ALL"<br/>]</pre> | no |
-| <a name="input_artifact_version"></a> [artifact\_version](#input\_artifact\_version) | GitHub release of this module whose prebuilt artifacts (dispatcher.zip, webhook-proxy.zip, entrypoint) are deployed; releases are built by .github/workflows/release.yml. | `string` | `"v0.0.9"` | no |
+| <a name="input_artifact_version"></a> [artifact\_version](#input\_artifact\_version) | GitHub release of this module whose prebuilt artifacts (dispatcher.zip, webhook-proxy.zip, entrypoint) are deployed; releases are built by .github/workflows/release.yml. | `string` | `"v0.0.10"` | no |
 | <a name="input_artifacts_bucket_name"></a> [artifacts\_bucket\_name](#input\_artifacts\_bucket\_name) | Override the S3 artifacts bucket name. Default (null) creates one named '<name\_prefix>-artifacts-<account\_id>'. | `string` | `null` | no |
 | <a name="input_base_image_name"></a> [base\_image\_name](#input\_base\_image\_name) | AWS-managed MicroVM base image short name, resolved to arn:aws:lambda:<region>:aws:microvm-image:<name>. | `string` | `"al2023-1"` | no |
 | <a name="input_base_image_version"></a> [base\_image\_version](#input\_base\_image\_version) | Major version of the AWS-managed base image (base\_image\_name), as a single number (e.g. "0"). Cloud Control requires it and validates the format. | `string` | `"0"` | no |
