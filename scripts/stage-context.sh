@@ -4,8 +4,8 @@
 # Staging (instead of zipping microvm/ directly) is what lets consumers swap in
 # their own Dockerfile / extra context files without forking the module.
 #
-# Invoked by Terraform (terraform_data.artifacts local-exec), after
-# fetch-artifacts.sh has downloaded + verified the entrypoint binary.
+# Invoked by scripts/prepare-artifacts.sh (data.external.artifacts, at plan),
+# after fetch-artifacts.sh has downloaded + verified the entrypoint binary.
 #
 # Usage: stage-context.sh <builtin-dir> <staged-dir> <entrypoint-bin> [<context-dir>]
 #   builtin-dir     the module's microvm/ directory (Dockerfile + wait-for-docker.sh)

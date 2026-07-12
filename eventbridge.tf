@@ -20,7 +20,7 @@ resource "aws_cloudwatch_event_archive" "runners" {
 
 # ── the proxy ────────────────────────────────────────────────────────────────
 # The zip is a prebuilt release artifact fetched (and checksum-verified) by
-# terraform_data.artifacts in dispatcher.tf; local.proxy_zip is defined there.
+# data.external.artifacts in dispatcher.tf; local.proxy_zip is defined there.
 
 resource "aws_cloudwatch_log_group" "proxy" {
   name              = "/aws/lambda/${var.name_prefix}-webhook-proxy"
@@ -108,7 +108,7 @@ resource "aws_lambda_function" "proxy" {
   }
 
   depends_on = [
-    terraform_data.artifacts,
+    data.external.artifacts,
     aws_iam_role_policy.proxy,
     aws_cloudwatch_log_group.proxy,
   ]

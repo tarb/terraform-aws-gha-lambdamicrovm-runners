@@ -1,13 +1,14 @@
 ###############################################################################
-# Dispatcher Lambda (Rust, provided.al2023). A terraform_data fetch step
-# downloads the prebuilt release artifacts (dispatcher.zip, webhook-proxy.zip,
-# entrypoint) for var.artifact_version from this module's GitHub releases and
-# verifies them against the release's SHA256SUMS before anything reads them.
+# Dispatcher Lambda (Rust, provided.al2023). A plan-time fetch step
+# (data.external.artifacts) downloads the prebuilt release artifacts
+# (dispatcher.zip, webhook-proxy.zip, entrypoint) for var.artifact_version from
+# this module's GitHub releases and verifies them against the release's
+# SHA256SUMS before anything reads them.
 ###############################################################################
 
 locals {
-  # The fetch step writes these files and the functions/image read them, so the
-  # paths are shared (there is no resource attribute to reference for them).
+  # The plan-time fetch (data.external.artifacts below) writes these files and
+  # the functions/image read them, so the paths are shared.
   artifact_dir   = "${path.module}/.terraform-build/${var.artifact_version}"
   dispatcher_zip = "${local.artifact_dir}/dispatcher.zip"
   proxy_zip      = "${local.artifact_dir}/webhook-proxy.zip"
@@ -19,58 +20,33 @@ locals {
   # which custom-image overrides are set.
   context_dir = "${path.module}/.terraform-build/context"
 
-  # Plan-time fingerprint of var.build_context_dir (relative path + content of
-  # every file). fileset()/filesha256() are evaluated at plan, which only works
-  # because the directory is user-provided config that exists at plan time; it
-  # cannot capture files another resource generates during the same apply.
-  build_context_fingerprint = var.build_context_dir == "" ? "" : sha256(join("\n", [
-    for f in sort(fileset(var.build_context_dir, "**")) :
-    "${f}:${filesha256("${var.build_context_dir}/${f}")}"
-  ]))
 }
 
-resource "terraform_data" "artifacts" {
-  # Re-fetch + restage when the pinned release or any custom-image input
-  # changes, OR when any artifact/staged file is absent from this workspace:
-  # ephemeral CI workspaces never carry them, so without the fileexists trigger
-  # the provisioner (which only fires on create/replace) never re-runs and the
-  # resources below read files that existed only in the workspace that
-  # originally created this resource. timestamp() forces the replace; local
-  # workspaces that still hold the files stay stable.
-  triggers_replace = {
-    version = var.artifact_version
-    # Custom-image inputs: restage (and thus re-zip) when the Dockerfile
-    # override or any file under build_context_dir changes.
-    dockerfile    = sha256(var.dockerfile)
-    build_context = local.build_context_fingerprint
-    # The zip now reads a staged COPY of the built-in context, so edits to
-    # microvm/* must force a restage (before staging, the archive read
-    # microvm/ directly and picked them up implicitly).
-    builtin_context = sha256(join("\n", [
-      filesha256("${path.module}/microvm/Dockerfile"),
-      filesha256("${path.module}/microvm/wait-for-docker.sh"),
-    ]))
-    artifacts = alltrue([
-      fileexists(local.dispatcher_zip),
-      fileexists(local.proxy_zip),
-      fileexists("${local.artifact_dir}/entrypoint"),
-      fileexists("${local.context_dir}/Dockerfile"),
-      fileexists("${local.context_dir}/wait-for-docker.sh"),
-      fileexists("${local.context_dir}/.artifacts/entrypoint"),
-    ]) ? "present" : timestamp()
-  }
-
-  # Download + verify the release artifacts, then assemble the image build
-  # context (base dir + wait-for-docker.sh + entrypoint binary + Dockerfile)
-  # into local.context_dir for the microvm code zip. The Dockerfile override
-  # travels via the environment, not argv, so arbitrary Dockerfile text cannot
-  # break shell quoting.
-  provisioner "local-exec" {
-    command = "bash '${path.module}/scripts/fetch-artifacts.sh' '${var.artifact_version}' '${local.artifact_dir}' && bash '${path.module}/scripts/stage-context.sh' '${path.module}/microvm' '${local.context_dir}' '${local.artifact_dir}/entrypoint' '${var.build_context_dir}'"
-    environment = {
-      DOCKERFILE_OVERRIDE = var.dockerfile
-    }
-  }
+# Fetch + verify the release artifacts and assemble the image build context
+# AT PLAN TIME. A data source (re-)runs on every plan, so every workspace —
+# including a fresh ephemeral CI one — holds the files before anything reads
+# them, and downstream values (zip md5, S3 key, lambda hashes) are
+# deterministic: plans are clean unless content actually changed. The previous
+# terraform_data shape had to force a replace (timestamp()) whenever files
+# were absent, churning every CI plan. Idempotent: verified artifacts aren't
+# re-downloaded; staging is a cheap rebuild that always reflects the current
+# dockerfile/build_context inputs, so no change-detection triggers are needed.
+# Argv rides the exec array (no shell), so the Dockerfile text can't break
+# quoting. Requires bash + curl on the PLAN host as well as the apply host.
+#
+# Split plan/apply pipelines: a saved plan does NOT re-run this at apply, and
+# aws_s3_object.source + the lambda filenames re-read the files there — ship
+# .terraform-build/ alongside the plan artifact (see s3.tf).
+data "external" "artifacts" {
+  program = [
+    "bash", "${path.module}/scripts/prepare-artifacts.sh",
+    var.artifact_version,
+    local.artifact_dir,
+    "${path.module}/microvm",
+    local.context_dir,
+    var.build_context_dir,
+    var.dockerfile,
+  ]
 }
 
 resource "aws_cloudwatch_log_group" "dispatcher" {
@@ -129,7 +105,7 @@ resource "aws_lambda_function" "dispatcher" {
   # No attribute links the fetch to the function, so depend explicitly: the zip
   # must exist before the create/update within one apply.
   depends_on = [
-    terraform_data.artifacts,
+    data.external.artifacts,
     aws_iam_role_policy.dispatcher,
     aws_cloudwatch_log_group.dispatcher,
   ]

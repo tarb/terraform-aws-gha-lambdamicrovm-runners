@@ -29,16 +29,14 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
 # Zip the STAGED image build context: Dockerfile at the archive root (required
 # by create-microvm-image), wait-for-docker.sh, and the fetched
 # .artifacts/entrypoint binary. The context is assembled into local.context_dir
-# by terraform_data.artifacts (scripts/stage-context.sh) from microvm/ — or
+# by data.external.artifacts (dispatcher.tf) AT PLAN TIME from microvm/ — or
 # var.build_context_dir — plus the var.dockerfile override, so the default and
 # custom images zip through the same path. source_dir (not inline source
 # blocks) because the entrypoint is a binary, which file() cannot carry.
-# depends_on defers the read to APPLY whenever terraform_data.artifacts has
-# pending changes (new artifact_version, changed dockerfile/build_context_dir/
-# microvm/* inputs, or artifacts/staged context absent from this workspace), so
-# the context is fetched + staged before the zip is built — and image rebuilds
-# trigger when any of those change. Otherwise everything exists at plan time
-# and output_md5 stays stable.
+# source_dir references the data source's RESULT (not local.context_dir
+# directly) so the zip always reads after staging within the plan; both are
+# plan-time reads, so output_md5 is known at plan and only moves when the
+# staged content moves — image rebuilds trigger exactly on real change.
 #
 # With no overrides the staged dir holds exactly what microvm/ held at zip time
 # (Dockerfile, wait-for-docker.sh, .artifacts/entrypoint), so the zip content —
@@ -46,19 +44,17 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
 # because of the staging indirection itself.
 data "archive_file" "microvm_code" {
   type        = "zip"
-  source_dir  = local.context_dir
+  source_dir  = data.external.artifacts.result.context_dir
   output_path = "${path.module}/.terraform-build/microvm-code.zip"
   excludes    = [".DS_Store", "**/.DS_Store"]
-
-  depends_on = [terraform_data.artifacts]
 }
 
 resource "aws_s3_object" "microvm_code" {
   bucket = aws_s3_bucket.artifacts.id
   key    = "microvm-images/${var.name_prefix}-runner/code-artifact-${data.archive_file.microvm_code.output_md5}.zip"
-  # SPLIT PLAN/APPLY CONTRACT: when the artifact fetch has no pending changes,
-  # archive_file writes this zip during PLAN, and `source` (like filebase64 —
-  # both re-evaluate at apply) needs it present in the APPLY workspace too.
+  # SPLIT PLAN/APPLY CONTRACT: archive_file writes this zip during PLAN, and
+  # `source` (like filebase64 — both re-evaluate at apply) needs it present in
+  # the APPLY workspace too; a saved plan does NOT re-run the plan-time fetch.
   # Pipelines that plan and apply in separate jobs must ship .terraform-build/
   # (the fetched artifacts + the staged image build context + this zip)
   # alongside the plan artifact (e.g. via an upload-artifact step between the

@@ -3,7 +3,7 @@
 # entrypoint) for a given GitHub release of this module and verify them against
 # the release's SHA256SUMS. Releases are built by .github/workflows/release.yml.
 #
-# Invoked by Terraform (terraform_data.artifacts local-exec).
+# Invoked by scripts/prepare-artifacts.sh (data.external.artifacts, at plan).
 #
 # Usage: fetch-artifacts.sh <version> <dest-dir>
 #   version   release tag, e.g. v0.0.1
