@@ -75,7 +75,7 @@ ARG GO_VERSION=1.26.4
 RUN curl -fSL "https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz" | tar -xz -C /usr/local
 
 # Rust via rustup (system-wide), clippy+rustfmt; sccache wraps rustc.
-ARG RUST_VERSION=1.96.1
+ARG RUST_VERSION=1.97.1
 ARG SCCACHE_VERSION=0.16.0
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo
