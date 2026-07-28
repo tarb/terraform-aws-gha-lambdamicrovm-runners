@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
 module's release tags (`artifact_version`).
 
+## [v0.0.12]
+
+### Changed
+
+- **Baked Rust toolchain 1.96.1 → 1.97.1** (`RUST_VERSION` in
+  `microvm/Dockerfile`). Affects only the toolchain jobs get inside the
+  runner image; the crates' MSRV (`rust-version` in `Cargo.toml`) is
+  unchanged. Consumers pick it up on the next image rebuild after
+  bumping the module ref.
+
 ## [v0.0.11]
 
 ### Added
