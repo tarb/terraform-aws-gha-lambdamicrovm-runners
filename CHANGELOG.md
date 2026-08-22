@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
 module's release tags (`artifact_version`).
 
+## [v0.0.13]
+
+### Changed
+
+- **Baked Go toolchain 1.26.4 → 1.27.0 and Rust toolchain 1.97.1 → 1.98.0**
+  (`GO_VERSION` / `RUST_VERSION` in `microvm/Dockerfile`). Affects only the
+  toolchains jobs get inside the runner image; the crates' MSRV
+  (`rust-version` in `Cargo.toml`) is unchanged. Consumers pick them up on
+  the next image rebuild after bumping the module ref.
+- **All other baked tools bumped to latest** (`microvm/Dockerfile`):
+  actions runner 2.335.1 → 2.336.0, docker compose v5.2.0 → v5.5.0,
+  sccache 0.16.0 → 0.17.0, buildx 0.35.0 → 0.36.1, terraform
+  1.15.7 → 1.15.9, tflint 0.63.1 → 0.64.0, gh 2.96.0 → 2.98.0, yq
+  4.53.3 → 4.53.6, golangci-lint 2.12.2 → 2.13.1 (adds go1.27 support,
+  pairing the Go bump), kubectl 1.36.2 → 1.36.4, bun 1.3.14 → 1.4.0.
+  tf-summarize is already latest (0.3.20).
+- **helm 3.21.2 → 4.2.4 (breaking major).** No fleet-served CI job invokes
+  the baked helm CLI today (Terraform's helm provider embeds its own SDK;
+  ArgoCD vendors its own helm), so nothing breaks — but any job that
+  starts using it gets Helm 4 semantics: kstatus-based `--wait`,
+  server-side apply, and Helm 3 plugins don't load. Helm 3 feature
+  releases end 2026-09; security patches end 2027-02.
+
 ## [v0.0.12]
 
 ### Changed

@@ -142,9 +142,9 @@ See [docs/USAGE.md#custom-image](docs/USAGE.md#custom-image) for details.
 | Name | Version |
 | ---- | ------- |
 | <a name="provider_archive"></a> [archive](#provider\_archive) | 2.8.0 |
-| <a name="provider_aws"></a> [aws](#provider\_aws) | 6.56.0 |
-| <a name="provider_awscc"></a> [awscc](#provider\_awscc) | 1.94.0 |
-| <a name="provider_external"></a> [external](#provider\_external) | 2.4.0 |
+| <a name="provider_aws"></a> [aws](#provider\_aws) | 6.61.0 |
+| <a name="provider_awscc"></a> [awscc](#provider\_awscc) | 1.98.0 |
+| <a name="provider_external"></a> [external](#provider\_external) | 2.4.1 |
 | <a name="provider_github"></a> [github](#provider\_github) | 6.13.0 |
 | <a name="provider_random"></a> [random](#provider\_random) | 3.9.0 |
 

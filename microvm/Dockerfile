@@ -9,8 +9,8 @@
 FROM public.ecr.aws/lambda/microvms:al2023-minimal
 
 # Lambda MicroVMs are Graviton/arm64-only, so the runner is the linux-arm64 build.
-ARG RUNNER_VERSION=2.335.1
-ARG RUNNER_SHA256_ARM64=6d1e85bfd1a506a8b17c1f1b9b57dba458ffed90898799aaa9f599520b0d9207
+ARG RUNNER_VERSION=2.336.0
+ARG RUNNER_SHA256_ARM64=58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1
 
 # Runner .NET deps (libicu is mandatory) + tools + python3/pip for JOBS: the
 # Actions ecosystem expects python3 on runners (setup steps, scripts, actions),
@@ -44,7 +44,7 @@ RUN dnf install -y --setopt=install_weak_deps=0 docker iptables \
 
 # Docker Compose v2 plugin (not packaged on AL2023) so `docker compose ...` works,
 # like GitHub-hosted runners. Many test scripts (e.g. `docker compose run`) need it.
-ARG COMPOSE_VERSION=v5.2.0
+ARG COMPOSE_VERSION=v5.5.0
 RUN mkdir -p /usr/libexec/docker/cli-plugins \
     && curl -fSL -o /usr/libexec/docker/cli-plugins/docker-compose \
          "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-aarch64" \
@@ -71,12 +71,12 @@ RUN dnf install -y --setopt=install_weak_deps=0 \
     && rm -rf /var/cache/dnf /var/cache/libdnf5
 
 # Go toolchain (jobs that vendor modules need no downloads).
-ARG GO_VERSION=1.26.4
+ARG GO_VERSION=1.27.0
 RUN curl -fSL "https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz" | tar -xz -C /usr/local
 
 # Rust via rustup (system-wide), clippy+rustfmt; sccache wraps rustc.
-ARG RUST_VERSION=1.97.1
-ARG SCCACHE_VERSION=0.16.0
+ARG RUST_VERSION=1.98.0
+ARG SCCACHE_VERSION=0.17.0
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path \
@@ -86,14 +86,14 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path \
     && chmod 0755 /usr/local/bin/sccache
 
 # docker buildx — enables `docker buildx bake` / multi-target builds.
-ARG BUILDX_VERSION=0.35.0
+ARG BUILDX_VERSION=0.36.1
 RUN curl -fSL -o /usr/libexec/docker/cli-plugins/docker-buildx \
       "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-arm64" \
     && chmod 0755 /usr/libexec/docker/cli-plugins/docker-buildx
 
 # terraform + tflint — for Terraform CI jobs
-ARG TERRAFORM_VERSION=1.15.7
-ARG TFLINT_VERSION=0.63.1
+ARG TERRAFORM_VERSION=1.15.9
+ARG TFLINT_VERSION=0.64.0
 RUN curl -fSL -o /tmp/tf.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_arm64.zip" \
     && unzip -q /tmp/tf.zip terraform -d /usr/local/bin && rm /tmp/tf.zip \
     && curl -fSL -o /tmp/tflint.zip "https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/tflint_linux_arm64.zip" \
@@ -103,8 +103,8 @@ RUN curl -fSL -o /tmp/tf.zip "https://releases.hashicorp.com/terraform/${TERRAFO
 # gh (PR comments, release automation) + yq (YAML processing)
 # — both preinstalled on GitHub-hosted runners, so their absence here only
 # shows when a job flips to the fleet.
-ARG GH_VERSION=2.96.0
-ARG YQ_VERSION=4.53.3
+ARG GH_VERSION=2.98.0
+ARG YQ_VERSION=4.53.6
 RUN curl -fSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_arm64.tar.gz" \
       | tar -xz --strip-components=2 -C /usr/local/bin --wildcards '*/bin/gh' \
     && curl -fSL -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_arm64" \
@@ -117,10 +117,10 @@ RUN curl -fSL "https://github.com/dineshba/tf-summarize/releases/download/v${TF_
     && chmod 0755 /usr/local/bin/tf-summarize
 
 # golangci-lint, kubectl, helm, bun
-ARG GOLANGCI_VERSION=2.12.2
-ARG KUBECTL_VERSION=1.36.2
-ARG HELM_VERSION=3.21.2
-ARG BUN_VERSION=1.3.14
+ARG GOLANGCI_VERSION=2.13.1
+ARG KUBECTL_VERSION=1.36.4
+ARG HELM_VERSION=4.2.4
+ARG BUN_VERSION=1.4.0
 RUN curl -fSL "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_VERSION}/golangci-lint-${GOLANGCI_VERSION}-linux-arm64.tar.gz" \
       | tar -xz --strip-components=1 -C /usr/local/bin --wildcards '*/golangci-lint' \
     && curl -fSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/arm64/kubectl" \
