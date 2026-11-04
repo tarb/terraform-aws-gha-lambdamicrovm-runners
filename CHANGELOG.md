@@ -18,6 +18,13 @@ module's release tags (`artifact_version`).
   up on the next image rebuild after bumping the module ref. No other
   baked tool changes.
 
+### Fixed
+
+- **async-trait 0.1.89 → 0.1.92** (`Cargo.lock`). Clippy 1.99 rejects the
+  bare `#[must_use]` that 0.1.89 puts on generated methods
+  (`double_must_use`), which failed the CI and release gates on stable.
+  0.1.92 brings in syn 3 alongside syn 2. Lockfile only, no code changes.
+
 ## [v0.0.13]
 
 ### Changed
