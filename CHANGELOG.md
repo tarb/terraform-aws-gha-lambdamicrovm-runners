@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
 module's release tags (`artifact_version`).
 
+## [v0.0.14]
+
+### Changed
+
+- **Baked actions runner 2.336.0 → 2.338.2** (`RUNNER_VERSION` /
+  `RUNNER_SHA256_ARM64` in `microvm/Dockerfile`). GitHub stops running
+  jobs on 2.336.0 on 2026-11-05. The runner's registration code
+  (`config.sh`, `run --jitconfig`) is unchanged between the two versions.
+  2.338.0 moves the runner's own Node use (`hashFiles()`,
+  `run.sh --check`) to its bundled Node 24, and 2.338.2 ships the patched
+  .NET 8.0.33 runtime (CVE-2026-111497, CVE-2026-70197). Consumers pick it
+  up on the next image rebuild after bumping the module ref. No other
+  baked tool changes.
+
+### Fixed
+
+- **async-trait 0.1.89 → 0.1.92** (`Cargo.lock`). Clippy 1.99 rejects the
+  bare `#[must_use]` that 0.1.89 puts on generated methods
+  (`double_must_use`), which failed the CI and release gates on stable.
+  0.1.92 brings in syn 3 alongside syn 2. Lockfile only, no code changes.
+
 ## [v0.0.13]
 
 ### Changed
