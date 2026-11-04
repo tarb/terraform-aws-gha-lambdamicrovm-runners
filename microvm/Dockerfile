@@ -9,8 +9,8 @@
 FROM public.ecr.aws/lambda/microvms:al2023-minimal
 
 # Lambda MicroVMs are Graviton/arm64-only, so the runner is the linux-arm64 build.
-ARG RUNNER_VERSION=2.336.0
-ARG RUNNER_SHA256_ARM64=58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1
+ARG RUNNER_VERSION=2.338.2
+ARG RUNNER_SHA256_ARM64=670adb2f268fe21dcbb58b3db0e0aa9d5b3bddfe2c651481336e561ff86de945
 
 # Runner .NET deps (libicu is mandatory) + tools + python3/pip for JOBS: the
 # Actions ecosystem expects python3 on runners (setup steps, scripts, actions),
